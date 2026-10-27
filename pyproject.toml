@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "twutils"
+version = "0.1.0.dev0"
+description = "Utilities for TOFWERK GC-TOF-MS h5 files: reading, mass calibration, peak extraction with peaxart"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENCE" }
+authors = [
+  { name = "Lionel Constantin", email = "lionel.constantin@empa.ch" },
+]
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "h5py>=3.8",
+  "peaxart",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+twutils = "twutils.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/twutils"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
