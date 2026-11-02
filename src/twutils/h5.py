@@ -116,6 +116,16 @@ class TofFile:
             files with several segments (EI/CI instruments).
         :return: intensity (n_scans, n_points) float32 and rt (n_scans,) s.
         """
+        return self.read_scans(self.scan_range(rt_start, rt_stop), tof_start, tof_stop, segments)
+
+    def read_scans(
+        self,
+        scans: slice,
+        tof_start: int = 0,
+        tof_stop: int | None = None,
+        segments: tuple[int, int] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Spectra of the scans ``scans`` (a slice of the time axis), as :meth:`read`."""
         if segments is None:
             if self.n_segments != 1:
                 raise ValueError(f"{self.path.name} has {self.n_segments} segments: give the segments to read.")
@@ -125,8 +135,8 @@ class TofFile:
             raise ValueError(f"Invalid segments {segments}, the file has {self.n_segments}.")
         tof_stop = self.n_points if tof_stop is None else min(tof_stop, self.n_points)
         tof_start = max(0, tof_start)
-        scans = self.scan_range(rt_start, rt_stop)
-        n = scans.stop - scans.start
+        scans = slice(*scans.indices(self.n_scans)[:2])
+        n = max(0, scans.stop - scans.start)
         if n == 0 or tof_stop <= tof_start:
             return np.zeros((n, max(0, tof_stop - tof_start)), np.float32), self.time_axis[scans]
         w0 = scans.start // self.n_bufs

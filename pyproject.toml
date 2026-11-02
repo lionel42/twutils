@@ -16,11 +16,18 @@ dependencies = [
   "numpy>=1.24",
   "pandas>=2.0",
   "h5py>=3.8",
+  "scipy>=1.10",
+  "pyyaml>=6",
   "peaxart",
 ]
 
 [project.optional-dependencies]
 test = ["pytest"]
+# m/z of calibrant formulas: the alpinac of gitlabs/alpinac (>= 1.0), not the
+# legacy alpinac of halosearch (same package name: do not install both)
+formulas = ["alpinac>=1.0.0.dev0"]
+# calibration plots (twutils.plots, twutils calibrate --plots, twutils plot-calibration)
+plots = ["matplotlib>=3.6"]
 
 [project.scripts]
 twutils = "twutils.cli:main"
@@ -30,3 +37,4 @@ packages = ["src/twutils"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["real_data: on the h5 files of /media/Shuttle (skipped if absent)"]

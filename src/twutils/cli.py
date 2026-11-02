@@ -1,4 +1,4 @@
-"""Command line: ``twutils extract`` and ``twutils info``."""
+"""Command line: ``twutils extract``, ``twutils calibrate``, ``twutils plot-calibration`` and ``twutils info``."""
 
 from __future__ import annotations
 
@@ -123,6 +123,124 @@ def run_extract(args) -> int:
     return 1 if failed else 0
 
 
+def _calibrants(values: list[str] | None) -> list | None:
+    """Formulas or m/z values."""
+    if values is None:
+        return None
+    out = []
+    for v in values:
+        try:
+            out.append(float(v))
+        except ValueError:
+            out.append(v)
+    return out
+
+
+def add_calibrate_parser(sub) -> None:
+    p = sub.add_parser("calibrate", help="Mass calibration of h5 files, following the drift with the retention time.",
+                       description="Fit the mass calibration in rt windows on calibrant ions and write the "
+                                   "alpinac calibration file (<run>.alpinac/<run>.EI_mc.txt by default), "
+                                   "used by 'twutils extract'.")
+    p.add_argument("files", nargs="+", help="h5 files (glob patterns allowed).")
+    p.add_argument("-c", "--calibrants-file", type=Path,
+                   help="Yaml file of the calibrants (and initial calibration), as "
+                        "/shared/scripts/tof-processing/config_calib.yml.")
+    p.add_argument("--calibrant", nargs="+", metavar="FORMULA",
+                   help="Calibrants present during the run: formulas (CF3, Re+2, [13C]O) or m/z values "
+                        "(instead of those of --calibrants-file). Default: the calibrants of the h5 file.")
+    p.add_argument("--spike", nargs="+", action="append", default=[], metavar=("RT", "FORMULA"),
+                   help="Calibrants injected at RT s (repeatable): --spike 1200 CF3 C2F5.")
+    p.add_argument("--mode", type=int, default=2, choices=range(6), help="TOFWERK calibration mode (default 2).")
+    p.add_argument("--averaging", type=float, default=360.0, help="Duration of the rt windows, s (default 360).")
+    p.add_argument("--spacing", type=float, default=120.0, help="Interval between the rt windows, s (default 120).")
+    p.add_argument("--rt-start", type=float, help="Start of the calibrated rt range, s.")
+    p.add_argument("--rt-stop", type=float, help="Stop of the calibrated rt range, s.")
+    p.add_argument("--mz-range", type=float, default=0.2, help="Half width of the calibrant domains, m/z (default 0.2).")
+    p.add_argument("--max-ppm", type=float, default=20.0, help="Calibrants with larger residuals are left out (default 20).")
+    p.add_argument("--initial", type=Path, help="Calibration file to find the calibrants (default: the h5 calibration).")
+    p.add_argument("--neutral", action="store_true", help="Neutral masses of the formulas without charge (legacy alpinac).")
+    p.add_argument("--ionisation", choices=["EI", "CI"], default="EI", help="Name of the output file (default EI).")
+    p.add_argument("--segments", type=_segments, help="Segments to read, START:STOP (EI/CI instruments).")
+    p.add_argument("-o", "--output", type=Path, help="Output file (one input file only).")
+    p.add_argument("--peaks-csv", action="store_true", help="Also write the calibrant peaks (.peaks.csv).")
+    p.add_argument("--plots", action="store_true",
+                   help="Also write the calibration plots (.<plot>.png next to the output, needs matplotlib).")
+    p.set_defaults(func=run_calibrate)
+
+
+def run_calibrate(args) -> int:
+    from twutils.calibrate import Calibrants, calibrate_to_file
+
+    files = _files(args.files)
+    if not files:
+        return 1
+    if args.output is not None and len(files) > 1:
+        raise SystemExit("--output can only be used with one file.")
+    try:
+        spikes = {float(rt): _calibrants(cals) for rt, *cals in args.spike}
+    except ValueError:
+        raise SystemExit("--spike: expected RT FORMULA [FORMULA ...]") from None
+    calibrants = _calibrants(args.calibrant)
+    if args.calibrants_file is not None:
+        config = Calibrants.from_yaml(args.calibrants_file)
+        calibrants = config if calibrants is None else Calibrants(calibrants, config.spikes, config.initial)
+    failed = 0
+    for path in files:
+        try:
+            result = calibrate_to_file(
+                path, output=args.output, ionisation=args.ionisation, peaks_csv=args.peaks_csv,
+                calibrants=calibrants, spikes=spikes, mode=args.mode, averaging=args.averaging,
+                spacing=args.spacing, rt_start=args.rt_start, rt_stop=args.rt_stop, mz_range=args.mz_range,
+                max_ppm=args.max_ppm, initial=args.initial, ionised=not args.neutral, segments=args.segments,
+            )
+            print(result.summary())
+            if args.plots:
+                for png in result.plot(args.output, args.ionisation).values():
+                    print(f"  {png}")
+        except Exception:
+            logger.exception(f"Calibration of '{path}' failed")
+            failed += 1
+    return 1 if failed else 0
+
+
+def add_plot_parser(sub) -> None:
+    p = sub.add_parser("plot-calibration", help="Plots of mass calibrations written by 'twutils calibrate'.",
+                       description="Plot a *_mc.txt file and its calibrant peaks (.peaks.csv next to it, from "
+                                   "'twutils calibrate --peaks-csv'; without them only the parameters and the "
+                                   "drift). The plots are written next to the calibration file.")
+    p.add_argument("files", nargs="+", help="*_mc.txt files, or h5 files (their <run>.alpinac/<run>.EI_mc.txt).")
+    p.add_argument("--peaks", type=Path, help="Calibrant peaks file (one input file only).")
+    p.add_argument("--plot", nargs="+", dest="plots", metavar="NAME",
+                   help="Plots to make: parameters drift residuals peak_shape (default all).")
+    p.add_argument("--ionisation", choices=["EI", "CI"], default="EI", help="Calibration file of the h5 files.")
+    p.add_argument("--show", action="store_true", help="Show the plots.")
+    p.set_defaults(func=run_plot)
+
+
+def run_plot(args) -> int:
+    from twutils.calibration import mc_path
+    from twutils.h5 import TofFile
+    from twutils.plots import PLOTS, plot_outputs
+
+    files = _files(args.files)
+    if not files:
+        return 1
+    if args.peaks is not None and len(files) > 1:
+        raise SystemExit("--peaks can only be used with one file.")
+    failed = 0
+    for path in files:
+        mc_file = mc_path(TofFile(path), args.ionisation) if path.suffix == ".h5" else path
+        try:
+            pngs = plot_outputs(mc_file, args.peaks, args.plots or PLOTS, show=args.show)
+            print(mc_file)
+            for png in pngs.values():
+                print(f"  {png}")
+        except Exception:
+            logger.exception(f"Plots of '{mc_file}' failed")
+            failed += 1
+    return 1 if failed else 0
+
+
 def add_info_parser(sub) -> None:
     p = sub.add_parser("info", help="Dimensions, timing and mass calibration of h5 files.")
     p.add_argument("files", nargs="+", help="h5 files (glob patterns allowed).")
@@ -156,6 +274,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="count", default=0, help="-v: info, -vv: debug.")
     sub = parser.add_subparsers(dest="command", required=True)
     add_extract_parser(sub)
+    add_calibrate_parser(sub)
+    add_plot_parser(sub)
     add_info_parser(sub)
     args = parser.parse_args(argv)
     level = [logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)]

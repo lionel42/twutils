@@ -7,6 +7,9 @@ Quick start::
     # peaks of a rt window, written in the format of the alpinac identification
     twutils.extract_to_file("241007.0423.air.1.h5", rt_start=1638, rt_stop=1647)
 
+    # mass calibration following the drift -> <run>.alpinac/<run>.EI_mc.txt
+    twutils.calibrate("241007.0423.air.1.h5", "config_calib.yml").write()
+
     # or step by step
     run = twutils.TofFile("241007.0423.air.1.h5")
     cal = twutils.MassCalibration.for_file(run)          # <run>.alpinac/<run>.EI_mc.txt
@@ -16,6 +19,12 @@ Quick start::
     result.to_alpinac("CH3I.frag.txt")
 """
 
+from twutils.calibrate import (
+    Calibrants,
+    CalibrationResult,
+    calibrate,
+    calibrate_to_file,
+)
 from twutils.calibration import MassCalibration, mass_to_tof, tof_to_mass
 from twutils.extract import Extraction, default_output, extract, extract_to_file
 from twutils.h5 import TofFile
@@ -23,9 +32,13 @@ from twutils.h5 import TofFile
 __version__ = "0.1.0.dev0"
 
 __all__ = [
+    "Calibrants",
+    "CalibrationResult",
     "Extraction",
     "MassCalibration",
     "TofFile",
+    "calibrate",
+    "calibrate_to_file",
     "default_output",
     "extract",
     "extract_to_file",

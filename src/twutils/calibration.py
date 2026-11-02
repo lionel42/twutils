@@ -13,11 +13,12 @@ mode  tof index i of mass m
 5     m = p1 i^2 + p2 i + p3
 ====  ===========================================
 
-The calibration of the GC-TOF runs drifts with the retention time. The legacy
-alpinac fits it at several rts and writes it in a ``*_mc.txt`` file, with the
-peak shape (pseudo-Voigt sigma vs tof index, Lorentzian fraction) and the
-calibration uncertainty vs m/z. Without that file, the acquisition calibration
-stored in the h5 file is used, with default peak shape and uncertainty.
+The calibration of the GC-TOF runs drifts with the retention time. It is
+fitted at several rts (:func:`twutils.calibrate`, or the legacy alpinac) and
+written in a ``*_mc.txt`` file, with the peak shape (pseudo-Voigt sigma vs tof
+index, Lorentzian fraction) and the calibration uncertainty vs m/z. Without
+that file, the acquisition calibration stored in the h5 file is used, with
+default peak shape and uncertainty.
 """
 
 from __future__ import annotations
@@ -80,6 +81,11 @@ def tof_to_mass(tof, params: dict, mode: int) -> np.ndarray:
     raise NotImplementedError(f"Mass calibration mode {mode}")
 
 
+def mc_path(file: TofFile, ionisation: str = "EI") -> Path:
+    """Calibration file of a run, as the legacy alpinac: ``<run>.alpinac/<run>.<ionisation>_mc.txt``."""
+    return file.path.parent / f"{file.stem}.alpinac" / f"{file.stem}.{ionisation}_mc.txt"
+
+
 @dataclass
 class MassCalibration:
     """Mass calibration of a run, optionally varying with the retention time.
@@ -89,6 +95,8 @@ class MassCalibration:
     :param params: (n, n_params) parameters p1, p2, ... at each rt; linearly
         interpolated in between, constant outside.
     :param sigma_slope, sigma_intercept: mass peak sigma = intercept + slope x tof index.
+    :param sigma_mz_slope, sigma_mz_intercept: the same in m/z units vs m/z
+        (only written in the ``*_mc.txt`` file).
     :param alpha: Lorentzian fraction of the pseudo-Voigt mass peaks.
     :param u_masses, u_ppm: calibration uncertainty (ppm) vs m/z.
     :param source: where the calibration was read.
@@ -99,6 +107,8 @@ class MassCalibration:
     params: np.ndarray
     sigma_slope: float = 3.6e-05
     sigma_intercept: float = 0.51
+    sigma_mz_slope: float = float("nan")
+    sigma_mz_intercept: float = float("nan")
     alpha: float = 0.48
     u_masses: np.ndarray = field(default_factory=lambda: np.array([0.0, 400.0]))
     u_ppm: np.ndarray = field(default_factory=lambda: np.array([50.0, 50.0]))
@@ -150,8 +160,34 @@ class MassCalibration:
             kwargs = {"u_masses": u[:, 0], "u_ppm": u[:, 1]}
         order = np.argsort(rts)
         return cls(mode=mode, rt=np.array(rts)[order], params=np.array(params)[order],
-                   sigma_slope=float(head[3]), sigma_intercept=float(head[4]), alpha=float(head[7]),
+                   sigma_slope=float(head[3]), sigma_intercept=float(head[4]),
+                   sigma_mz_slope=float(head[5]), sigma_mz_intercept=float(head[6]), alpha=float(head[7]),
                    source=str(path), **kwargs)
+
+    def to_mc_file(self, path: str | PathLike, s_per_bin: float) -> Path:
+        """Write the calibration file of the legacy alpinac (read by :meth:`from_mc_file`).
+
+        The rts are written as scan indices (``rt / s_per_bin``, rounded).
+        """
+        path = Path(path)
+        head = [
+            (len(self.rt), "Number of points, mass cal. vs RT"),
+            (len(self.u_masses), "Number of points, mass cal. u vs mass"),
+            (self.mode, "Mass cal. mode"),
+            (self.sigma_slope, "Peak shape, sigma_slope vs TOF index"),
+            (self.sigma_intercept, "Peak shape, sigma_b vs TOF index"),
+            (self.sigma_mz_slope, "Peak shape, sigma_slope vs mass"),
+            (self.sigma_mz_intercept, "Peak shape, sigma_b vs mass"),
+            (self.alpha, "alpha, for tofidx Pseudo-Voigt fit"),
+            (s_per_bin, "s_per_bin"),
+        ]
+        lines = [f"{value}\t{text}" for value, text in head]
+        lines += ["\t".join([str(round(rt / s_per_bin))] + [repr(float(p)) for p in params])
+                  for rt, params in zip(self.rt, self.params, strict=True)]
+        lines += [f"{m:.7f}\t{u:.2f}" for m, u in zip(self.u_masses, self.u_ppm, strict=True)]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n")
+        return path
 
     @classmethod
     def for_file(cls, file: TofFile | str | PathLike, ionisation: str = "EI",
@@ -166,7 +202,7 @@ class MassCalibration:
         if mc_file is not None:
             return cls.from_mc_file(mc_file)
         directory, stem = file.path.parent, file.stem
-        for candidate in (directory / f"{stem}.alpinac" / f"{stem}.{ionisation}_mc.txt",
+        for candidate in (mc_path(file, ionisation),
                           directory / f"{stem}.{ionisation}_mc.txt",
                           directory / f"{stem}.mc.txt"):
             if candidate.is_file():
@@ -198,6 +234,13 @@ class MassCalibration:
         """Tof index of m/z values at retention times (broadcast)."""
         rt, mz = np.broadcast_arrays(np.asarray(rt, dtype=float), np.asarray(mz, dtype=float))
         return mass_to_tof(mz, self.params_at(rt), self.mode)
+
+    def drift_ppm(self, mz, rt, reference_rt: float | None = None) -> np.ndarray:
+        """Mass drift: error (ppm) on ``mz`` at ``rt`` if the calibration of
+        ``reference_rt`` (default: the first calibration rt) were used (broadcast)."""
+        reference_rt = float(self.rt[0]) if reference_rt is None else reference_rt
+        mz = np.asarray(mz, dtype=float)
+        return (self.mz(reference_rt, self.tof(rt, mz)) - mz) / mz * 1e6
 
     def sigma(self, tof) -> np.ndarray:
         """Sigma of the mass peaks, tof index units."""
