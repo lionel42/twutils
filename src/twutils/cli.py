@@ -1,4 +1,5 @@
-"""Command line: ``twutils extract``, ``twutils calibrate``, ``twutils plot-calibration`` and ``twutils info``."""
+"""Command line: ``twutils extract``, ``twutils calibrate``, ``twutils plot-calibration``, ``twutils info``
+and ``twutils check``."""
 
 from __future__ import annotations
 
@@ -269,6 +270,45 @@ def run_info(args) -> int:
     return 0
 
 
+def add_check_parser(sub) -> None:
+    p = sub.add_parser("check", help="Check that runs have data (filament emission, signal, duration).",
+                       description="One line per run: ok, unreadable, short, filament_off, filament_failed (with "
+                                   "the rt), switched_off (target set to 0 by the acquisition), no_signal or filament_unstable. Exit code 1 if a run is not ok.")
+    p.add_argument("files", nargs="+", help="h5 files (glob patterns allowed).")
+    p.add_argument("--emission-fraction", type=float, default=0.5,
+                   help="Emission monitor below this fraction of the target: no emission (default 0.5).")
+    p.add_argument("--min-sum-spectrum", type=float, default=1e4,
+                   help="Maximum of FullSpectra/SumSpectrum below this: no signal (default 1e4).")
+    p.add_argument("--min-duration", type=float, default=600.0, help="Shorter runs are 'short', s (default 600).")
+    p.add_argument("--min-gap", type=float, default=5.0,
+                   help="Shorter stretches without emission are ignored, s (default 5).")
+    p.add_argument("--max-startup", type=float, default=60.0,
+                   help="No emission before this rt (filament warm-up) is not a problem, s (default 60).")
+    p.add_argument("--not-ok", action="store_true", help="Only print the runs that are not ok.")
+    p.add_argument("--csv", type=Path, help="Also write the results to this csv file.")
+    p.set_defaults(func=run_check)
+
+
+def run_check(args) -> int:
+    from twutils.qc import QCConfig, check, to_dataframe
+
+    files = _files(args.files)
+    if not files:
+        return 1
+    config = QCConfig(emission_fraction=args.emission_fraction, min_sum_spectrum=args.min_sum_spectrum,
+                      min_duration=args.min_duration, min_gap=args.min_gap,
+                      max_startup=args.max_startup)
+    results = []
+    for path in files:
+        qc = check(path, config)
+        results.append(qc)
+        if not (args.not_ok and qc.ok):
+            print(qc, flush=True)
+    if args.csv is not None:
+        to_dataframe(results).to_csv(args.csv)
+    return 0 if all(qc.ok for qc in results) else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="twutils", description="Utilities for TOFWERK h5 files.")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="-v: info, -vv: debug.")
@@ -277,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
     add_calibrate_parser(sub)
     add_plot_parser(sub)
     add_info_parser(sub)
+    add_check_parser(sub)
     args = parser.parse_args(argv)
     level = [logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)]
     logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s: %(message)s", level=logging.WARNING)

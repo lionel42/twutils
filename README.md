@@ -2,6 +2,8 @@
 
 Utilities for TOFWERK GC-TOF-MS h5 files:
 
+- `check`: is there data in a run? Filament emission (from the instrument
+  housekeeping data), signal, duration, readable file;
 - `TofFile`: reads the spectra (`FullSpectra/TofData`) of a retention time
   window and a tof index range, and the time axis;
 - `MassCalibration`: tof index <-> m/z (TOFWERK modes 0-5), varying with the
@@ -58,6 +60,9 @@ twutils extract run.h5 --rt 1642 4.5 --rt-sigma 1.5 --config peak_linear_ratio=0
 
 # dimensions, timing, mass calibration used
 twutils info run.h5
+
+# is there data? one line per run, exit code 1 if a run is not ok
+twutils check "/media/Shuttle/TOF-Data/2026/2610*.h5" --not-ok --csv qc.csv
 ```
 
 `twutils extract -h` lists all options. Also `python -m twutils`.
@@ -120,6 +125,21 @@ See `scripts/extract_rt_window.py` for a script to edit.
   m/z, with the uncertainty), `peak_shape` (sigma and alpha vs m/z). The last
   two need the calibrant peaks: from a result, or the `.peaks.csv` file
   (`--peaks-csv`) when plotting from the files. Calibrants left out are hollow.
+- **Run check** (`twutils check`, `twutils.check`): the filament channels are read by name from
+  `TPS2/TwData` / `TPS2/TwInfo` (`FILAMENT_EMISSION monitor` / `target`, `FILAMENT_CURRENT monitor`).
+  The acquisition lowers the emission target from 0.5 to 0.05 mA during parts of the run (~10-200 s,
+  ~380-1100 s), so the monitor is compared with the target of each scan: below half of it, no emission.
+  Stretches without emission shorter than 5 s are ignored (the monitor follows a step of the target in
+  ~1 s), and so is the warm-up at the start (the filament is switched on at ~10 s and reaches its
+  target ~20 s later; not ignored if longer than 60 s). Status: `unreadable` (truncated / corrupt file), `short` (< 600 s written), `filament_off` (never
+  any emission), `filament_failed` (lost for good, with the rt), `switched_off` (target set to 0 by the
+  acquisition: not a failure, the data before are fine), `no_signal` (max of `FullSpectra/SumSpectrum`
+  < 1e4: ~1e8 in a normal run, ~50 with the filament off), `filament_unstable` (lost for a while), `ok`.
+  Speed: `TPS2/TwData` and `TimingData/BufTimes` are stored in one chunk per scan, slow to read from
+  a USB disk (~8 s per file). So the times come from the attributes (`NbrWrites`, `NbrBufs`,
+  `BlockPeriod`; within ~10 ms of `BufTimes`), and the channels are read at the first scan of each write
+  (~3 s), at full resolution only around a failure: ~1.8 s per file on the Shuttle disk, less once
+  cached. Files without `TPS2` are only checked on the signal.
 - **Mass calibration**: searched as in the legacy alpinac:
   `--mass-cal` file, `<run>.alpinac/<run>.<EI|CI>_mc.txt`, `<run>.<EI|CI>_mc.txt`,
   `<run>.mc.txt`, then the h5 attributes (with a warning: the acquisition

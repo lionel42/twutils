@@ -7,6 +7,9 @@ Quick start::
     # peaks of a rt window, written in the format of the alpinac identification
     twutils.extract_to_file("241007.0423.air.1.h5", rt_start=1638, rt_stop=1647)
 
+    # is there data in the run (filament, signal)?
+    twutils.check("241007.0423.air.1.h5").status         # 'ok', 'filament_failed', ...
+
     # mass calibration following the drift -> <run>.alpinac/<run>.EI_mc.txt
     twutils.calibrate("241007.0423.air.1.h5", "config_calib.yml").write()
 
@@ -28,6 +31,7 @@ from twutils.calibrate import (
 from twutils.calibration import MassCalibration, mass_to_tof, tof_to_mass
 from twutils.extract import Extraction, default_output, extract, extract_to_file
 from twutils.h5 import TofFile
+from twutils.qc import QCConfig, RunQC, check
 
 __version__ = "0.1.0.dev0"
 
@@ -36,9 +40,12 @@ __all__ = [
     "CalibrationResult",
     "Extraction",
     "MassCalibration",
+    "QCConfig",
+    "RunQC",
     "TofFile",
     "calibrate",
     "calibrate_to_file",
+    "check",
     "default_output",
     "extract",
     "extract_to_file",
