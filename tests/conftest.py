@@ -1,7 +1,6 @@
 """Small synthetic TOFWERK h5 files.
 
 - :func:`write_h5`: one compound with two mass peaks;
-- :func:`write_drift_h5`: calibrants present all along, the calibration drifts;
 - :func:`write_run`: the instrument channels of the run check (TPS2), tiny spectra.
 
 As TOFWERK, the buffers not written at the end of the file have zero spectra and
@@ -13,14 +12,11 @@ from __future__ import annotations
 import h5py
 import numpy as np
 import pytest
-from peaxart.shapes import LEGACY, pseudo_voigt_height
-from peaxart.shapes import pseudo_voigt as pv
-
-from twutils.calibration import mass_to_tof
+from masscal import mass_to_tof
 
 N_WRITES, N_BUFS, N_POINTS = 40, 10, 6000
 S_PER_BIN = 0.2
-CAL = {"p1": 600.0, "p2": -200.0, "p3": 0.5}  # mode 2
+CAL = {"p1": 600.0, "p2": -200.0, "p3": 0.5}  # power mode (TOFWERK 2)
 RT_APEX = 40.0
 PEAKS = {(69.0, 1000.0), (100.0, 400.0)}  # (m/z, height)
 SIGMA_B, SIGMA_SLOPE, ALPHA = 0.5, 4e-5, 0.5
@@ -47,14 +43,27 @@ def write_timing(f: h5py.File, buf_times: np.ndarray, period: float, unwritten: 
         f.attrs["NbrBlocks"] = np.array([1], dtype=np.int32)
 
 
-def write_h5(path, n_segments: int = 1, unwritten: int = 0, attrs: bool = True):
+STEP_EMISSION, STEP_EJECTION = 20.0, (50.0, 70.0)  # s
+STEP_CHANNELS = ["FILAMENT_EMISSION monitor [mA]", "FILAMENT_EMISSION target [mA]", "QUADA_REXAMPL1 target [V]",
+                 "QUADA_REXMASSE1 target [Th]"]
+
+
+def write_h5(path, n_segments: int = 1, unwritten: int = 0, attrs: bool = True, steps: bool = False):
+    """Synthetic run. With ``steps``, the acquisition steps of the real runs: the emission target
+    0.05 -> 0.5 mA at STEP_EMISSION (background x10), the ejection of m/z 100 during STEP_EJECTION
+    (background / 50); logged in TPS2 0.4 s after they take effect."""
     rng = np.random.default_rng(0)
     rt = (np.arange(N_WRITES * N_BUFS) + 1) * S_PER_BIN
     tof = np.arange(N_POINTS, dtype=float)
     data = rng.normal(1.0, 0.3, (len(rt), N_POINTS)).astype(np.float32)
+    if steps:
+        data[rt < STEP_EMISSION] /= 10
+        ejected = (rt >= STEP_EJECTION[0]) & (rt < STEP_EJECTION[1])
+        window = (tof > mass_to_tof(99.5, CAL, "power")) & (tof < mass_to_tof(100.5, CAL, "power"))
+        data[np.ix_(ejected, window)] /= 50
     chromato = np.exp(-((rt - RT_APEX) ** 2) / (2 * 1.5**2))
     for mz, height in PEAKS:
-        mu = float(mass_to_tof(mz, CAL, 2))
+        mu = float(mass_to_tof(mz, CAL, "power"))
         shape = pseudo_voigt(tof, mu, SIGMA_B + SIGMA_SLOPE * mu, ALPHA)
         data += (height * chromato[:, None] * shape).astype(np.float32)
     if unwritten:
@@ -69,6 +78,15 @@ def write_h5(path, n_segments: int = 1, unwritten: int = 0, attrs: bool = True):
         for k, v in CAL.items():
             fs.attrs[f"MassCalibration {k}"] = np.array([v])
         write_timing(f, rt.reshape(N_WRITES, N_BUFS), S_PER_BIN, unwritten, attrs)
+        if steps:
+            logged = rt - 0.4
+            tps = np.zeros((len(rt), len(STEP_CHANNELS)))
+            tps[:, 1] = np.where(logged < STEP_EMISSION, 0.05, 0.5)
+            tps[:, 0] = tps[:, 1] * 0.98
+            tps[:, 2] = np.where((logged >= STEP_EJECTION[0]) & (logged < STEP_EJECTION[1]), 3.0, 0.0)
+            tps[:, 3] = 97.0
+            f.create_dataset("TPS2/TwData", data=tps.reshape(N_WRITES, N_BUFS, -1))
+            f.create_dataset("TPS2/TwInfo", data=np.array([c.encode() for c in STEP_CHANNELS], dtype="S256"))
     return path
 
 
@@ -82,51 +100,6 @@ def write_mc(path, rts=(0.0, 400.0)):
     lines += [f"{int(rt / S_PER_BIN)}\t{CAL['p1']}\t{CAL['p2']}\t{CAL['p3']}" for rt in rts]
     lines += ["68.9946609\t2.50", "130.9914672\t1.50"]
     path.write_text("\n".join(lines) + "\n")
-    return path
-
-
-DRIFT_N_SCANS, DRIFT_N_POINTS = 600, 9400
-DRIFT_CALIBRANTS = [("A", 28.0061), ("B", 43.9898), ("C", 68.9947), ("D", 99.9931),
-                    ("E", 130.9915), ("F", 168.9883), ("G", 218.9851)]
-DRIFT_INTERFERENCE = (68.83, 300.0)  # (m/z, height): a weaker peak next to C
-
-
-def drift_params(rt):
-    """True calibration (mode 2) at rt: the tof indices shift by 0.8 over the run."""
-    return {"p1": 600.0, "p2": -200.0 + 0.8 * np.asarray(rt) / (DRIFT_N_SCANS * S_PER_BIN), "p3": 0.5}
-
-
-def write_drift_h5(path):
-    """A run where the calibrants are present all along and the calibration drifts.
-
-    The h5 calibration is the one of the start, off by 0.5 tof index.
-    """
-    rng = np.random.default_rng(1)
-    n_writes = DRIFT_N_SCANS // N_BUFS
-    rt = (np.arange(DRIFT_N_SCANS) + 1) * S_PER_BIN
-    tof = np.arange(DRIFT_N_POINTS, dtype=float)
-    data = rng.normal(1.0, 0.3, (len(rt), DRIFT_N_POINTS)).astype(np.float32)
-    peaks = [(mz, 2000.0) for _, mz in DRIFT_CALIBRANTS] + [DRIFT_INTERFERENCE]
-    for i, t in enumerate(rt):
-        for mz, height in peaks:
-            mu = float(mass_to_tof(mz, drift_params(t), 2))
-            sigma = SIGMA_B + SIGMA_SLOPE * mu
-            area = height / pseudo_voigt_height(1.0, sigma, ALPHA)
-            data[i] += pv(tof, area, mu, sigma, ALPHA, LEGACY).astype(np.float32)
-    initial = {**drift_params(0.0), "p2": -200.5}
-    with h5py.File(path, "w") as f:
-        fs = f.create_group("FullSpectra")
-        fs.create_dataset("TofData", data=data.reshape(n_writes, N_BUFS, 1, DRIFT_N_POINTS),
-                          chunks=(1, 1, 1, DRIFT_N_POINTS))
-        fs.create_dataset("MassAxis", data=((tof - initial["p2"]) / initial["p1"]) ** 2)
-        fs.attrs["MassCalibMode"] = np.array([2], dtype=np.int32)
-        for k, v in initial.items():
-            fs.attrs[f"MassCalibration {k}"] = np.array([v])
-        fs.attrs["MassCalibration nbrPoints"] = np.array([len(DRIFT_CALIBRANTS)], dtype=np.int32)
-        for k, (name, mz) in enumerate(DRIFT_CALIBRANTS, start=1):
-            fs.attrs[f"MassCalibration m{k}"] = np.array([mz])
-            fs.attrs[f"MassCalibration l{k}"] = name.encode()
-        write_timing(f, rt.reshape(n_writes, N_BUFS), S_PER_BIN)
     return path
 
 
@@ -160,11 +133,6 @@ def write_run(path, emission=None, target=None, sum_max: float = 1e8, unwritten:
                              chunks=(1, 1, len(QC_CHANNELS)))
             f.create_dataset("TPS2/TwInfo", data=np.array([c.encode() for c in QC_CHANNELS], dtype="S256"))
     return path
-
-
-@pytest.fixture(scope="session")
-def drift_file(tmp_path_factory):
-    return write_drift_h5(tmp_path_factory.mktemp("drift") / "241007.0423.air.1.h5")
 
 
 @pytest.fixture

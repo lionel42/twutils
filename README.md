@@ -8,46 +8,27 @@ Utilities for TOFWERK GC-TOF-MS h5 files:
   window and a tof index range, or of a whole run in blocks, the time axis, the
   instrument channels (`TPS2`) and the acquisition log. Only the written scans;
   a truncated or corrupt file raises `TofFileError`;
-- `MassCalibration`: tof index <-> m/z (TOFWERK modes 0, 1, 2 and 5; m/z -> tof
-  only for 3 and 4), varying with the
-  retention time, and the mass peak shape. Read from the `*_mc.json` file of
-  `twutils calibrate`, the `*_mc.txt` file of the legacy alpinac (read only),
-  or the h5 attributes;
-- `calibrate`: the mass calibration of a run, following its drift with the
-  retention time (method of the legacy `alpinac.mass_calibration`, peaks
-  detected and fitted with peaxart), written in a `*_mc.json` file;
+- `calibration_for`: the mass calibration of a run (a `masscal.MassCalibration`:
+  tof index <-> m/z varying with the retention time, mass peak shape), from its
+  `*_mc.json` file, the `*_mc.txt` file of the legacy alpinac, or the h5 attributes.
+  The calibration is fitted by `esper calibrate` ([masscal](../masscal));
 - `extract`: peak extraction with [peaxart](../peaxart), written in the peak file
   format of the alpinac identification (the `.frag.txt` files of the legacy
-  `alpinac_extract`).
+  `alpinac_extract`);
+
+The unit mass chromatograms are made by `esper chromatograms` (esper, peaxart).
 
 ## Install
 
 ```bash
-pip install -e ../peaxart
+pip install -e ../peaxart -e ../masscal
 pip install -e .
 ```
-
-The m/z of calibrant formulas (`twutils calibrate`) come from the
-[alpinac](../alpinac) package (`pip install -e ../alpinac`, or `.[formulas]`).
-It has the same package name as the legacy alpinac of halosearch: in an
-environment with the legacy one (e.g. `/shared/pyenv`, used by the
-tof-processing pipeline), use `PYTHONPATH=../alpinac/src` or give the
-calibrants as m/z values.
 
 ## Command line
 
 ```bash
-# mass calibration with the drift -> 241007.0423.air.1.alpinac/241007.0423.air.1.seg0_mc.json
-twutils -v calibrate 241007.0423.air.1.h5 -c /shared/scripts/tof-processing/config_calib.yml
-
-# calibrants of the h5 file (PFTBA only on our instruments: m/z < 69 extrapolated), other windows
-twutils calibrate "/media/Shuttle/TOF-Data/2024/2403*.air.*.h5" --averaging 240 --spacing 60
-twutils calibrate run.h5 --calibrant CF3 C2F5 C3F5 N2 O2 Ar --spike 1200 C4F9 --peaks-csv
-
-# plots of the calibration (next to the _mc.json file: <run>.seg0_mc.<plot>.png)
-twutils calibrate run.h5 -c config_calib.yml --peaks-csv --plots
-twutils plot-calibration run.alpinac/run.seg0_mc.json       # from the outputs (or give the h5 file)
-twutils plot-calibration run.h5 --plot drift residuals --show
+# (the mass calibration: esper calibrate run.h5, see esper)
 
 # rt window, all the masses of the file -> 241007.0423.air.1.alpinac/241007.0423.air.1.frag.1638s1647s.txt
 twutils -v extract 241007.0423.air.1.h5 --rt-start 1638 --rt-stop 1647 -j 8
@@ -86,19 +67,10 @@ result = twutils.extract("run.h5", rt_start=1638, rt_stop=1647, masses=range(20,
 result.peaks                       # peaxart table + compound column
 result.to_alpinac("run.frag.txt", metadata={"sample": "tank 5"})
 
-# mass calibration
-result = twutils.calibrate("run.h5", "config_calib.yml")   # or a list, or twutils.Calibrants
-result.windows                     # per rt window: calibrants used, rms ppm, p1, p2, ...
-result.peaks                       # every calibrant peak: tof, sigma, alpha, ppm, used
-result.calibration.drift_ppm(150, [600, 1800, 3000])  # drift since the first window
-result.write(peaks_csv=True)       # <run>.alpinac/<run>.seg0_mc.json, used by extract (+ .peaks.csv)
-result.plot()                      # <run>.alpinac/<run>.seg0_mc.<plot>.png; plot(write=False): figures
-twutils.plots.plot_outputs("run.alpinac/run.seg0_mc.json")  # the same from the files
-twutils.extract("run.h5", rt_start=1638, rt_stop=1647, calibration=result.calibration)
-
 # reading and calibration only
 run = twutils.TofFile("run.h5")
-cal = twutils.MassCalibration.for_file(run)        # or .from_file(...), .from_h5(run)
+cal = twutils.calibration_for(run)                 # masscal.MassCalibration; or twutils.h5_calibration(run)
+run.start_time                                     # acquisition start (rt 0), UTC to the ms
 intensity, rt = run.read(1638, 1647, tof_start=20000, tof_stop=21000)
 mz = cal.mz(rt[:, None], range(20000, 21000))      # (n_scans, n_points)
 
@@ -106,6 +78,9 @@ mz = cal.mz(rt[:, None], range(20000, 21000))      # (n_scans, n_points)
 with run.open():
     for scans, rt, data in run.iter_blocks(block=600, tof_start=20000, tof_stop=21000):
         ...
+
+# spectra summed over scan ranges at some tof indices (read once, in blocks)
+sums = run.sum_spectra([(0, 1800), (600, 2400)], columns=[11230, 11231, 11232])
 ```
 
 See `scripts/extract_rt_window.py` for a script to edit.
@@ -116,40 +91,16 @@ See `scripts/extract_rt_window.py` for a script to edit.
   duration; the buffers not written (acquisition stopped early, incomplete last
   write) contain zeros. `TofFile` only uses the written scans (`run.n_scans`,
   from the `NbrWrites` complete writes, else the last non-zero `BufTimes`), so
-  the default rt ranges of `extract` and `calibrate` stop at the last one. The
+  the default rt ranges of `extract` and of the calibration stop at the last one. The
   time axis is `TimingData/BufTimes` (checked to increase), or
   `run.regular_time_axis` from the scan period without reading it (`BufTimes`
   is stored in one chunk per scan: ~2 s to read on a USB disk).
 - **Bad files**: the commands go on with the next file when one fails. A
   truncated or corrupt file is logged in one line; any other error with its
   traceback. The exit code is 1 if a file failed.
-- **Parameters**: `twutils.calibrate(run, config=CalibrationConfig(...))`, or the fields
-  directly (`twutils.calibrate(run, averaging=60, mode=0)`); `twutils.check(run, QCConfig(...))`;
+- **Parameters**: `twutils.check(run, QCConfig(...))`;
   `twutils.extract(run, config=peaxart.ExtractionConfig(...))`. The defaults of the command line
   are those of these classes.
-- **Mass calibration with the drift** (`twutils calibrate`, legacy method):
-  the run is cut in rt windows (360 s every 120 s); in each window the spectra
-  are summed around each calibrant (+-0.2 m/z), the peaks detected (peaxart)
-  and fitted with pseudo-Voigt functions of free sigma and alpha, and the
-  calibration fitted to the calibrant peaks, leaving out those above 20 ppm.
-  The peak shape (sigma vs tof, alpha) and the uncertainty per m/z come from
-  the calibrant peaks used. Calibrants: formulas (`CF3`, `Re+2`, `[13C]O`) or
-  m/z, or the yaml file of the tof-processing pipeline (`-c`,
-  `twutils.Calibrants.from_yaml`: `"0.0"` continuous, other keys spike rts,
-  `default` the initial calibration); default the calibrants of the h5 file
-  (PFTBA on our instruments). The air ions (N2, O2, Ar, CO2) are needed for
-  accurate masses below m/z 69. Differences with the
-  legacy code: ion masses (the legacy code used neutral masses, ~8 ppm at m/z
-  69, `--neutral` to reproduce it), outliers also removed by leverage, the run
-  is read once (~25 s for a 50 min run). Spikes are fitted with the closest
-  window, at their own rt. Modes 0, 1, 2 and 5. On 240315.2211.air.1 it agrees with
-  the legacy calibration to ~1 ppm (median) once the electron mass is accounted for.
-- **Calibration plots** (`twutils.plots`, needs matplotlib: `.[plots]`), as the
-  legacy `make_final_plots`: `parameters` (p1, p2, ... and the residuals vs rt),
-  `drift` (vs rt, of the calibration and of each calibrant), `residuals` (vs
-  m/z, with the uncertainty), `peak_shape` (sigma and alpha vs m/z). The last
-  two need the calibrant peaks: from a result, or the `.peaks.csv` file
-  (`--peaks-csv`) when plotting from the files. Calibrants left out are hollow.
 - **Run check** (`twutils check`, `twutils.check`): the filament channels are read by name from
   `TPS2/TwData` / `TPS2/TwInfo` (`FILAMENT_EMISSION monitor` / `target`, `FILAMENT_CURRENT monitor`).
   The acquisition lowers the emission target from 0.5 to 0.05 mA during parts of the run (~10-200 s,
@@ -167,15 +118,10 @@ See `scripts/extract_rt_window.py` for a script to edit.
   channels are read at the first scan of each write (~3 s) and at the last scan, at full resolution only
   around a failure: ~1.8 s per file on the Shuttle disk, less once cached. Files without `TPS2` are only
   checked on the signal.
-- **Mass calibration file**: `<run>.alpinac/<run>.seg0_mc.json`, written by
-  `twutils calibrate` (`twutils.calibration.FORMAT`), one per segment range of the
+- **Mass calibration file**: `<run>.alpinac/<run>.seg0_mc.json` (`twutils.mc_path`), written by
+  `esper calibrate` (format `masscal.FORMAT`), one per segment range of the
   spectra (`seg0`, `seg1`, `seg1-2` for segments 1 and 2 summed; files with one
-  segment: `seg0`): the segment range, mode, rts (s), parameters,
-  peak shape and uncertainty, and how it was made in `metadata` (h5 file,
-  calibrants, `CalibrationConfig`, initial calibration, versions, date, and the
-  result of each rt window); NaN written as null. The `*_mc.txt` files of the
-  legacy alpinac are still read (not written any more: the legacy pipeline keeps
-  its own calibration until it is retired).
+  segment: `seg0`). The `*_mc.txt` files of the legacy alpinac are still read.
 - **Mass calibration search**: `--mass-cal` file, `<run>.alpinac/<run>.seg0_mc.json`
   (of the segments read), then the legacy files of the ionisation: `<run>.alpinac/<run>.<EI|CI>_mc.txt`, `<run>.<EI|CI>_mc.txt`,
   `<run>.mc.txt`, then the h5 attributes (with a warning: the acquisition
@@ -188,8 +134,8 @@ See `scripts/extract_rt_window.py` for a script to edit.
   with 10 s (`margin`) of data on each side; a peak belongs to the block of its
   apex. A whole run is ~3.5 GB of float32. A window shorter than `block` is
   extracted exactly as given.
-- **Files with several segments** (EI/CI instruments): the segments to read or
-  calibrate are required (`--segments 1`, `--segments 1:3` sums 1 and 2); each
+- **Files with several segments** (EI/CI instruments): the segments to read
+  are required (`--segments 1`, `--segments 1:3` sums 1 and 2); each
   segment range has its own calibration file. For the extraction, also the
   ionisation (`--ionisation CI --adduct ...`): the spectrum id of the output is
   0 for EI, 1 for CI. `twutils info` shows the calibration of each segment.
@@ -205,6 +151,5 @@ See `scripts/extract_rt_window.py` for a script to edit.
 ## Development
 
 ```bash
-python -m pytest                   # tests/test_real_data.py needs /media/Shuttle (skipped otherwise)
-python -m pytest -m "not real_data"
+python -m pytest
 ```

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "twutils"
 version = "0.1.0.dev0"
-description = "Utilities for TOFWERK GC-TOF-MS h5 files: reading, mass calibration, peak extraction with peaxart"
+description = "Utilities for TOFWERK GC-TOF-MS h5 files: reading, run check, peak extraction with peaxart"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENCE" }
@@ -16,18 +16,12 @@ dependencies = [
   "numpy>=1.24",
   "pandas>=2.0",
   "h5py>=3.8",
-  "scipy>=1.10",
-  "pyyaml>=6",
   "peaxart",
+  "masscal",  # the mass calibration (model, files); fitted by esper calibrate
 ]
 
 [project.optional-dependencies]
 test = ["pytest"]
-# m/z of calibrant formulas: the alpinac of gitlabs/alpinac (>= 1.0), not the
-# legacy alpinac of halosearch (same package name: do not install both)
-formulas = ["alpinac>=1.0.0.dev0"]
-# calibration plots (twutils.plots, twutils calibrate --plots, twutils plot-calibration)
-plots = ["matplotlib>=3.6"]
 
 [project.scripts]
 twutils = "twutils.cli:main"
@@ -37,7 +31,6 @@ packages = ["src/twutils"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["real_data: on the h5 files of /media/Shuttle (skipped if absent)"]
 
 [tool.ruff]
 line-length = 120
@@ -48,4 +41,4 @@ select = ["E", "F", "W", "I", "UP", "B", "G"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["twutils"]
-known-third-party = ["conftest"]
+known-third-party = ["conftest", "masscal"]

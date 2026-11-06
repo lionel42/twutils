@@ -11,7 +11,7 @@ import logging
 import re
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from functools import cached_property
 from os import PathLike
 from pathlib import Path
@@ -26,6 +26,10 @@ _NAME_PATTERN = re.compile(r"(\d{6})\.(\d{4})\.([a-zA-Z0-9_-]+)\.(\d{1,2})")
 
 #: errors of h5py / HDF5 on a truncated or corrupt file (raised when opening it, or later when reading it)
 H5_ERRORS = (OSError, RuntimeError, KeyError)
+
+
+#: origin of the Windows FILETIME of ``TimingData/AcquisitionTimeZero`` (100 ns ticks)
+_FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=UTC)
 
 
 class TofFileError(Exception):
@@ -162,6 +166,28 @@ class TofFile:
                 "sample_type": sample_type, "port": int(port)}
 
     @cached_property
+    def start_time(self) -> datetime | None:
+        """Start of the acquisition (rt 0), UTC (aware), to the ms: ``TimingData/AcquisitionTimeZero``,
+        else the first entry of the acquisition log; None if neither is readable.
+
+        The file name has the start to the minute (UTC as well).
+        """
+        with self._file() as f:
+            zero = f["TimingData"].attrs.get("AcquisitionTimeZero") if "TimingData" in f else None
+            if zero is not None and int(_scalar(zero)) > 0:
+                return _FILETIME_EPOCH + timedelta(microseconds=int(_scalar(zero)) // 10)
+            if "AcquisitionLog/Log" not in f:
+                return None
+            log = f["AcquisitionLog/Log"][()]
+        if log.dtype.names is None or "timestring" not in log.dtype.names or not len(log):
+            return None
+        try:
+            start = datetime.fromisoformat(_scalar(log["timestring"][0]))
+        except (TypeError, ValueError):
+            return None
+        return start.astimezone(UTC) if start.tzinfo else None
+
+    @cached_property
     def time_axis(self) -> np.ndarray:
         """Retention time of each written scan, s (``TimingData/BufTimes``).
 
@@ -265,6 +291,17 @@ class TofFile:
                 values = values[start - w0 * self.n_bufs: stop - w0 * self.n_bufs]
                 index = np.arange(start, stop)
         return index, {name: values[:, i].astype(float) for name, i in found.items()}
+
+    def tps2_changes(self, names: list[str], scans: slice | None = None) -> list[tuple[str, int, float, float]]:
+        """Changes of the value of ``TPS2`` channels (e.g. targets set by the acquisition), at full
+        resolution: [(name, first scan with the new value, old value, new value)], sorted by scan.
+        The channels are logged ~0.5 s after the change takes effect in the spectra."""
+        index, values = self.read_tps2(names, scans)
+        changes = []
+        for name, v in values.items():
+            for i in np.flatnonzero(np.diff(v) != 0) + 1:
+                changes.append((name, int(index[i]), float(v[i - 1]), float(v[i])))
+        return sorted(changes, key=lambda c: (c[1], c[0]))
 
     # --- spectra ----------------------------------------------------------------
 
@@ -373,3 +410,30 @@ class TofFile:
                 data, rt = self.read_scans(slice(b0, b1), tof_start, tof_stop, segments)
                 yield slice(b0, b1), rt, data
                 b0 = b1
+
+    def sum_spectra(self, scan_ranges, columns=None, segments: tuple[int, int] | None = None,
+                    block: int = 600) -> np.ndarray:
+        """Spectra summed over scan ranges, at the tof indices ``columns`` (default all).
+
+        The run is read once, in blocks of about ``block`` scans (a whole run does not fit in
+        memory), between the first and last scan of the ranges; the ranges may overlap.
+
+        :param scan_ranges: (n, 2) scans [start, stop[ of each sum.
+        :param columns: increasing tof indices (e.g. :func:`masscal.tof_columns`).
+        :return: (n, len(columns)) float sums.
+        """
+        ranges = np.atleast_2d(np.asarray(scan_ranges, dtype=int)).reshape(-1, 2)
+        columns = np.arange(self.n_points) if columns is None else np.asarray(columns, dtype=int)
+        sums = np.zeros((len(ranges), len(columns)))
+        if len(ranges) == 0 or len(columns) == 0:
+            return sums
+        tof0, tof1 = int(columns.min()), int(columns.max()) + 1
+        first, last = int(ranges[:, 0].min()), int(ranges[:, 1].max())
+        for scans, _, data in self.iter_blocks(block, tof0, tof1, segments, slice(first, last)):
+            b0, b1 = scans.start, scans.stop
+            data = data[:, columns - tof0]
+            for k, (s0, s1) in enumerate(ranges):
+                lo, hi = max(s0, b0), min(s1, b1)
+                if hi > lo:
+                    sums[k] += data[lo - b0:hi - b0].sum(axis=0, dtype=float)
+        return sums

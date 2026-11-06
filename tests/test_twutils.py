@@ -1,28 +1,16 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import h5py
 import numpy as np
 import pandas as pd
 import pytest
-from conftest import CAL, N_POINTS, PEAKS, RT_APEX, S_PER_BIN, write_h5
+from conftest import CAL, N_POINTS, PEAKS, RT_APEX, S_PER_BIN, STEP_EJECTION, STEP_EMISSION, write_h5
+from masscal import MassCalibration, Mode, mass_to_tof
 
 import twutils
-from twutils.calibration import mass_to_tof, tof_to_mass
 from twutils.cli import main
-
-
-@pytest.mark.parametrize("mode, params", [
-    (0, {"p1": 2800.0, "p2": -3700.0}),
-    (1, {"p1": -2800.0, "p2": 30000.0}),
-    (2, {"p1": 2829.0, "p2": -3726.0, "p3": 0.4999}),
-    # Not implmented yet:
-    #(3, {"p1": 2829.0, "p2": -3726.0, "p3": 1e-4, "p4": 100.0}),
-    #(4, {"p1": 2829.0, "p2": -3726.0, "p3": 1e-6, "p4": 1e-3, "p5": 0.5}),
-    (5, {"p1": 1e-7, "p2": 1e-3, "p3": -2.0}),
-])
-def test_calibration_modes_round_trip(mode, params):
-    mz = np.array([12.0, 69.0, 131.0, 300.0])
-    np.testing.assert_allclose(tof_to_mass(mass_to_tof(mz, params, mode), params, mode), mz, rtol=1e-6)
 
 
 def test_read(h5_file):
@@ -113,66 +101,101 @@ def test_bad_files(tmp_path):
 
 
 def test_calibration_search(h5_file):
-    cal = twutils.MassCalibration.for_file(h5_file)
+    cal = twutils.calibration_for(h5_file)
     assert cal.source.endswith("EI_mc.txt")
     assert len(cal.rt) == 2 and cal.alpha == 0.5
-    tof = mass_to_tof(69.0, CAL, 2)
+    tof = mass_to_tof(69.0, CAL, "power")
     assert float(cal.mz(100.0, tof)) == pytest.approx(69.0)
     assert float(cal.tof(100.0, 69.0)) == pytest.approx(tof)
     np.testing.assert_allclose(cal.u_ppm_at([68.9946609, 130.9914672]), [2.5, 1.5])
 
     (h5_file.parent / "241007.0423.air.1.alpinac" / "241007.0423.air.1.EI_mc.txt").unlink()
-    h5_cal = twutils.MassCalibration.for_file(h5_file)
-    assert "h5 attributes" in h5_cal.source
+    h5_cal = twutils.calibration_for(h5_file)
+    assert "h5 attributes" in h5_cal.source and h5_cal.mode is Mode.POWER
     assert float(h5_cal.mz(0, tof)) == pytest.approx(69.0)
 
 
 def test_calibration_files(h5_file, tmp_path):
-    """The legacy *_mc.txt is read; the json file of twutils is preferred when both exist."""
-    legacy = twutils.MassCalibration.for_file(h5_file)
-    assert legacy.source.endswith("EI_mc.txt") and legacy.metadata == {}
+    """The legacy *_mc.txt is read; the json file of masscal is preferred when both exist."""
+    legacy = twutils.calibration_for(h5_file)
+    assert legacy.source.endswith("EI_mc.txt") and legacy.metadata == {"s_per_bin": pytest.approx(S_PER_BIN)}
     np.testing.assert_allclose(legacy.rt, [0.0, 400.0])
-    assert np.isnan(twutils.MassCalibration(mode=2, rt=[0], params=[[1, 2, 0.5]]).sigma_mz_slope)
 
-    cal = twutils.MassCalibration(mode=2, rt=[12.345, 400.1], params=[[600, -200, 0.5], [600, -199.9, 0.5]],
+    cal = MassCalibration(mode="power", rt=[12.345, 400.1], params=[[600, -200, 0.5], [600, -199.9, 0.5]],
                                   metadata={"note": "x"})
     path = cal.to_json(twutils.mc_path(h5_file))  # next to the legacy file
-    found = twutils.MassCalibration.for_file(h5_file)
+    found = twutils.calibration_for(h5_file)
     assert found.source == str(path) and found.metadata == {"note": "x"}
     np.testing.assert_array_equal(found.rt, cal.rt)
-    assert np.isnan(found.sigma_mz_slope)  # written as null
-    assert twutils.MassCalibration.from_file(cal.to_json(tmp_path / "x.txt")).rt[0] == 12.345  # by content
-
-    path.write_text('{"format": "twutils.mass_calibration", "version": 99}')
-    with pytest.raises(ValueError, match="newer"):
-        twutils.MassCalibration.from_json(path)
+    # a given file
+    other = cal.to_json(tmp_path / "x.json")
+    assert twutils.calibration_for(h5_file, mc_file=other).source == str(other)
 
 
 def test_calibration_of_segments(tmp_path, caplog):
     """Files with several segments: one calibration file per segment range."""
     run = twutils.TofFile(write_h5(tmp_path / "241007.0423.air.1.h5", n_segments=2))
     with pytest.raises(ValueError, match="2 segments"):
-        twutils.MassCalibration.for_file(run)
+        twutils.calibration_for(run)
     for k in range(2):
-        twutils.MassCalibration(mode=2, rt=[0.0], params=[[600, -200 + k, 0.5]], segments=(k, k + 1)).to_json(
+        MassCalibration(mode="power", rt=[0.0], params=[[600, -200 + k, 0.5]], segments=(k, k + 1)).to_json(
             twutils.mc_path(run, (k, k + 1)))
     for k in range(2):
-        cal = twutils.MassCalibration.for_file(run, (k, k + 1))
+        cal = twutils.calibration_for(run, (k, k + 1))
         assert cal.segments == (k, k + 1) and cal.params[0, 1] == -200 + k
         assert cal.source.endswith(f"seg{k}_mc.json")
     # no file for the segments 0 and 1 summed: the h5 calibration
-    assert "h5 attributes" in twutils.MassCalibration.for_file(run, (0, 2)).source
+    assert "h5 attributes" in twutils.calibration_for(run, (0, 2)).source
     # a calibration of other segments: warning
-    twutils.MassCalibration.for_file(run, (0, 1), mc_file=twutils.mc_path(run, (1, 2)))
+    twutils.calibration_for(run, (0, 1), mc_file=twutils.mc_path(run, (1, 2)))
     assert "segments (1, 2) used for the segments (0, 1)" in caplog.text
 
 
-def test_rt_dependent_calibration():
-    cal = twutils.MassCalibration(mode=2, rt=[0.0, 100.0], params=[[600, -200, 0.5], [600, -100, 0.5]])
-    assert cal.params_at(50.0)["p2"] == pytest.approx(-150.0)
-    assert cal.params_at(500.0)["p2"] == pytest.approx(-100.0)
-    rt = np.array([[0.0], [50.0]])
-    assert cal.mz(rt, np.arange(5)).shape == (2, 5)
+def test_h5_calibrants(h5_file):
+    assert twutils.h5_calibrants(h5_file) == []
+    with h5py.File(h5_file, "a") as f:
+        fs = f["FullSpectra"]
+        fs.attrs["MassCalibration nbrPoints"] = np.array([2], dtype=np.int32)
+        fs.attrs["MassCalibration m1"], fs.attrs["MassCalibration l1"] = np.array([68.9947]), b""
+        fs.attrs["MassCalibration m2"], fs.attrs["MassCalibration l2"] = np.array([130.9915]), b"C3F5"
+    assert twutils.h5_calibrants(h5_file) == [("68.9947", 68.9947), ("C3F5", 130.9915)]
+
+
+def test_sum_spectra(h5_file):
+    """Sums over scan ranges (overlapping, across blocks) at some tof indices."""
+    run = twutils.TofFile(h5_file)
+    data, _ = run.read_scans(slice(0, run.n_scans))
+    columns = np.array([10, 11, 500, 4000])
+    ranges = [(0, 25), (20, 333), (390, 400)]
+    sums = run.sum_spectra(ranges, columns, block=30)
+    expected = [data[a:b][:, columns].sum(axis=0, dtype=float) for a, b in ranges]
+    np.testing.assert_allclose(sums, expected, rtol=1e-6)
+    assert run.sum_spectra([(0, 5)]).shape == (1, run.n_points)
+
+
+def test_tps2_changes(tmp_path):
+    """Changes of TPS2 channels: emission target step, resonant ejection on and off (logged 0.4 s late)."""
+    run = twutils.TofFile(write_h5(tmp_path / "a.h5", steps=True))
+    changes = run.tps2_changes(["FILAMENT_EMISSION target", "QUADA_REXAMPL1"])
+    assert [(name[:10], round(old, 2), new) for name, _, old, new in changes] == [
+        ("FILAMENT_E", 0.05, 0.5), ("QUADA_REXA", 0.0, 3.0), ("QUADA_REXA", 3.0, 0.0)]
+    rt = run.time_axis
+    assert [round(float(rt[scan]) - 0.4, 1) for _, scan, _, _ in changes] == [STEP_EMISSION, *STEP_EJECTION]
+    assert run.tps2_changes(["FILAMENT_EMISSION target"], run.scan_range(30, 80)) == []
+
+
+def test_start_time(tmp_path):
+    """Start of the acquisition: AcquisitionTimeZero (FILETIME), else the acquisition log, else None."""
+    path = write_h5(tmp_path / "240315.2211.air.1.h5")
+    assert twutils.TofFile(path).start_time is None
+    with h5py.File(path, "a") as f:
+        log = np.array([(0, b"2024-03-15T23:11:39+01:00", b"Acquisition started")],
+                       dtype=[("timestamp", "<u8"), ("timestring", "S26"), ("logtext", "S256")])
+        f.create_dataset("AcquisitionLog/Log", data=log)
+    assert twutils.TofFile(path).start_time == datetime(2024, 3, 15, 22, 11, 39, tzinfo=UTC)
+    with h5py.File(path, "a") as f:
+        f["TimingData"].attrs["AcquisitionTimeZero"] = np.array([133550142997580000], dtype=np.uint64)
+    assert twutils.TofFile(path).start_time == datetime(2024, 3, 15, 22, 11, 39, 758000, tzinfo=UTC)
 
 
 def test_extract(h5_file):
@@ -226,7 +249,7 @@ def test_cli_continues_after_bad_file(h5_file, tmp_path, capsys, caplog):
     bad = tmp_path / "bad.h5"
     bad.write_bytes(b"not an h5 file")
     assert main(["info", str(bad), str(h5_file)]) == 1
-    assert "mode 2" in capsys.readouterr().out  # the good file after the bad one
+    assert "mode power" in capsys.readouterr().out  # the good file after the bad one
     assert "Info failed: bad.h5" in caplog.text and "cannot read" in caplog.text and "Traceback" not in caplog.text
     with pytest.raises(SystemExit, match="--rt cannot"):
         main(["extract", str(h5_file), "--rt", "40", "10", "--rt-start", "30"])
@@ -248,7 +271,7 @@ def test_cli(h5_file, tmp_path, capsys):
     text = out.read_text()
     assert "# operator: me" in text and "rt_window" in text
     assert main(["info", str(h5_file)]) == 0
-    assert "mode 2" in capsys.readouterr().out
+    assert "mode power" in capsys.readouterr().out
     two = write_h5(tmp_path / "two.h5", n_segments=2)
     assert main(["info", str(two)]) == 0  # each segment
     out = capsys.readouterr().out

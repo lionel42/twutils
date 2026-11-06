@@ -1,5 +1,7 @@
-"""Command line: ``twutils extract``, ``twutils calibrate``, ``twutils plot-calibration``, ``twutils info``
-and ``twutils check``."""
+"""Command line: ``twutils extract``, ``twutils info`` and ``twutils check``.
+
+The mass calibration and the unit mass chromatograms are made by esper (``esper calibrate``,
+``esper chromatograms``)."""
 
 from __future__ import annotations
 
@@ -109,7 +111,6 @@ def _add_outputs(p, peaks_csv: str) -> None:
 LEGACY_CALIBRATION = "name of the legacy calibration file <run>.<EI|CI>_mc.txt, used if there is no json file"
 
 
-
 def add_extract_parser(sub) -> None:
     from twutils.extraction import extract
 
@@ -208,131 +209,6 @@ def run_extract(args) -> int:
     return _for_each(files, "Extraction", run)
 
 
-def _calibrants(values: list[str] | None) -> list | None:
-    """Formulas or m/z values."""
-    if values is None:
-        return None
-    out = []
-    for v in values:
-        try:
-            out.append(float(v))
-        except ValueError:
-            out.append(v)
-    return out
-
-
-def add_calibrate_parser(sub) -> None:
-    from twutils.calibrate import CalibrationConfig
-
-    default = CalibrationConfig()
-
-    p = sub.add_parser("calibrate", help="Mass calibration of h5 files, following the drift with the retention time.",
-                       description="Fit the mass calibration in rt windows on calibrant ions and write the "
-                                   "calibration file (<run>.alpinac/<run>.seg0_mc.json by default), "
-                                   "used by 'twutils extract'.")
-    _add_files(p)
-    p.add_argument("-c", "--calibrants-file", type=Path,
-                   help="Yaml file of the calibrants (and initial calibration), as "
-                        "/shared/scripts/tof-processing/config_calib.yml.")
-    p.add_argument("--calibrant", nargs="+", metavar="FORMULA",
-                   help="Calibrants present during the run: formulas (CF3, Re+2, [13C]O) or m/z values "
-                        "(instead of those of --calibrants-file). Default: the calibrants of the h5 file.")
-    p.add_argument("--spike", nargs="+", action="append", default=[], metavar=("RT", "FORMULA"),
-                   help="Calibrants injected at RT s (repeatable): --spike 1200 CF3 C2F5.")
-    p.add_argument("--mode", type=int, default=default.mode, choices=[0, 1, 2, 5],
-                   help="TOFWERK calibration mode (default %(default)s).")
-    p.add_argument("--averaging", type=float, default=default.averaging,
-                   help="Duration of the rt windows, s (default %(default)s).")
-    p.add_argument("--spacing", type=float, default=default.spacing,
-                   help="Interval between the rt windows, s (default %(default)s).")
-    _add_rt_range(p, "calibrated rt range")
-    p.add_argument("--mz-range", type=float, default=default.mz_range,
-                   help="Half width of the calibrant domains, m/z (default %(default)s).")
-    p.add_argument("--max-ppm", type=float, default=default.max_ppm,
-                   help="Calibrants with larger residuals are left out (default %(default)s).")
-    p.add_argument("--initial", type=Path,
-                   help="Calibration file to find the calibrants (default: the h5 calibration).")
-    p.add_argument("--neutral", action="store_true",
-                   help="Neutral masses of the formulas without charge (legacy alpinac).")
-    _add_segments(p, "calibrated (names the output: <run>.seg0_mc.json, seg1-2 ...)")
-    _add_outputs(p, "the calibrant peaks")
-    p.add_argument("--plots", action="store_true",
-                   help="Also write the calibration plots (.<plot>.png next to the output, needs matplotlib).")
-    p.set_defaults(func=run_calibrate)
-
-
-def run_calibrate(args) -> int:
-    from twutils.calibrate import Calibrants, CalibrationConfig, calibrate_to_file
-
-    files = _files(args.files)
-    if not files:
-        return 1
-    if args.output is not None and len(files) > 1:
-        raise SystemExit("--output can only be used with one file.")
-    try:
-        spikes = {float(rt): _calibrants(cals) for rt, *cals in args.spike}
-    except ValueError:
-        raise SystemExit("--spike: expected RT FORMULA [FORMULA ...]") from None
-    calibrants = _calibrants(args.calibrant)
-    if args.calibrants_file is not None:
-        config = Calibrants.from_yaml(args.calibrants_file)
-        calibrants = config if calibrants is None else Calibrants(calibrants, config.spikes, config.initial)
-    config = CalibrationConfig(mode=args.mode, averaging=args.averaging, spacing=args.spacing,
-                               mz_range=args.mz_range, max_ppm=args.max_ppm, ionised=not args.neutral)
-
-    def run(path):
-        result = calibrate_to_file(
-            path, output=args.output, peaks_csv=args.peaks_csv,
-            output_dir=args.output_dir, calibrants=calibrants, spikes=spikes, rt_start=args.rt_start,
-            rt_stop=args.rt_stop, initial=args.initial, segments=args.segments, config=config,
-        )
-        print(result.summary())
-        if args.plots:
-            written = args.output or result.default_path(args.output_dir)
-            for png in result.plot(written).values():
-                print(f"  {png}")
-
-    return _for_each(files, "Calibration", run)
-
-
-def add_plot_parser(sub) -> None:
-    p = sub.add_parser("plot-calibration", help="Plots of mass calibrations written by 'twutils calibrate'.",
-                       description="Plot a *_mc.json file and its calibrant peaks (.peaks.csv next to it, from "
-                                   "'twutils calibrate --peaks-csv'; without them only the parameters and the "
-                                   "drift). The plots are written next to the calibration file.")
-    _add_files(p, "*_mc.json (or legacy *_mc.txt) files, or h5 files (their calibration file)")
-    p.add_argument("--peaks", type=Path, help="Calibrant peaks file (one input file only).")
-    p.add_argument("--plot", nargs="+", dest="plots", metavar="NAME",
-                   help="Plots to make: parameters drift residuals peak_shape (default all).")
-    _add_segments(p, "of the calibration file of the h5 files")
-    _add_ionisation(p, LEGACY_CALIBRATION)
-    p.add_argument("--show", action="store_true", help="Show the plots.")
-    p.set_defaults(func=run_plot)
-
-
-def run_plot(args) -> int:
-    from twutils.calibration import legacy_mc_paths, mc_path
-    from twutils.plots import PLOTS, plot_outputs
-
-    files = _files(args.files)
-    if not files:
-        return 1
-    if args.peaks is not None and len(files) > 1:
-        raise SystemExit("--peaks can only be used with one file.")
-
-    def run(path):
-        mc_file = path
-        if path.suffix == ".h5":
-            candidates = [mc_path(path, args.segments), *legacy_mc_paths(path, args.ionisation)]
-            mc_file = next((c for c in candidates if c.is_file()), candidates[0])
-        pngs = plot_outputs(mc_file, args.peaks, args.plots or PLOTS, show=args.show)
-        print(mc_file)
-        for png in pngs.values():
-            print(f"  {png}")
-
-    return _for_each(files, "Plots", run)
-
-
 def add_info_parser(sub) -> None:
     p = sub.add_parser("info", help="Dimensions, timing and mass calibration of h5 files.")
     _add_files(p)
@@ -342,7 +218,7 @@ def add_info_parser(sub) -> None:
 
 
 def run_info(args) -> int:
-    from twutils.calibration import MassCalibration
+    from twutils.calibration import calibration_for
     from twutils.h5 import TofFile, segments_label
 
     files = _files(args.files)
@@ -358,7 +234,7 @@ def run_info(args) -> int:
         rt = float(run.regular_time_axis[0]) if run.n_scans else 0.0  # m/z range at the start of the run
         ranges = [args.segments] if args.segments else [(k, k + 1) for k in range(run.n_segments)]
         for segments in ranges:
-            cal = MassCalibration.for_file(run, segments, args.ionisation)
+            cal = calibration_for(run, segments, args.ionisation)
             mz0, mz1 = (float(v) for v in cal.mz(rt, [0, run.n_points - 1]))
             label = f" {segments_label(segments)}" if run.n_segments > 1 or args.segments else ""
             print(f"  mass cal{label:5} : mode {cal.mode}, {len(cal.rt)} rt point(s), m/z {mz0:.1f} - {mz1:.1f}, "
@@ -424,8 +300,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="count", default=0, help="-v: info, -vv: debug.")
     sub = parser.add_subparsers(dest="command", required=True)
     add_extract_parser(sub)
-    add_calibrate_parser(sub)
-    add_plot_parser(sub)
     add_info_parser(sub)
     add_check_parser(sub)
     args = parser.parse_args(argv)

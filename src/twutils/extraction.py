@@ -13,8 +13,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import peaxart
+from masscal import MassCalibration
 
-from twutils.calibration import Ionisation, MassCalibration
+from twutils.calibration import Ionisation, calibration_for
 from twutils.h5 import TofFile, stem
 
 logger = logging.getLogger(__name__)
@@ -128,7 +129,7 @@ def extract(
         (default: the masses of the file).
     :param mz_range: half width of the domains around each unit mass, m/z.
     :param calibration: mass calibration, or the path of a ``*_mc.json`` (or legacy ``*_mc.txt``) file;
-        default: searched with :meth:`MassCalibration.for_file`.
+        default: searched with :func:`twutils.calibration_for`.
     :param ionisation: ``"EI"`` or ``"CI"``: spectrum id of the output, and name of the
         legacy calibration files.
     :param segments: segment range [start, stop[ to read (summed): required for files with
@@ -144,9 +145,9 @@ def extract(
     t0 = time.perf_counter()
     file = file if isinstance(file, TofFile) else TofFile(file)
     if calibration is None:
-        calibration = MassCalibration.for_file(file, segments, ionisation)
+        calibration = calibration_for(file, segments, ionisation)
     elif not isinstance(calibration, MassCalibration):
-        calibration = MassCalibration.for_file(file, segments, ionisation, mc_file=calibration)
+        calibration = calibration_for(file, segments, ionisation, mc_file=calibration)
     elif calibration.segments is not None and calibration.segments != file.resolve_segments(segments):
         logger.warning("%s: calibration of the segments %s used for the segments %s", file.path.name,
                        calibration.segments, file.resolve_segments(segments))
