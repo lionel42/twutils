@@ -7,47 +7,14 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pytest
+from conftest import QC_BUFS as N_BUFS
+from conftest import QC_DT as DT
+from conftest import QC_WRITES as N_WRITES
+from conftest import write_run
 
 import twutils
 from twutils.cli import main
 from twutils.qc import QCConfig, check
-
-N_WRITES, N_BUFS, DT = 100, 10, 1.0  # 1000 s run
-CHANNELS = ["Ionizer status monitor []", "FILAMENT_SELECT target []", "FILAMENT_EMISSION monitor [mA]",
-            "FILAMENT_EMISSION target [mA]", "FILAMENT_CURRENT target [A]", "FILAMENT_CURRENT monitor [A]"]
-
-
-def write_run(path: Path, emission=None, target=None, sum_max: float = 1e8, unwritten: int = 0,
-              n_writes: int = N_WRITES, tps2: bool = True, attrs: bool = False) -> Path:
-    """Small run with the TPS2 channels: ``emission`` / ``target`` functions of rt (default 0.5 mA)."""
-    n = n_writes * N_BUFS
-    rt = np.arange(n) * DT
-    target_values = np.full(n, 0.5) if target is None else target(rt)
-    emission_values = target_values.copy() if emission is None else emission(rt)
-    current = np.where(emission_values > 0.01, 1.1, 0.003)
-    tps = np.zeros((n, len(CHANNELS)))
-    tps[:, 0] = 5
-    tps[:, 1] = 1
-    tps[:, 2] = emission_values
-    tps[:, 3] = target_values
-    tps[:, 5] = current
-    buf_times = rt.copy()
-    if unwritten:
-        buf_times[-unwritten:] = 0
-        tps[-unwritten:] = 0
-    with h5py.File(path, "w") as f:
-        f.create_dataset("FullSpectra/TofData", data=np.zeros((n_writes, N_BUFS, 1, 4), dtype=np.float32))
-        f.create_dataset("FullSpectra/SumSpectrum", data=np.array([0.0, sum_max, 1.0, 2.0]))
-        f.create_dataset("TimingData/BufTimes", data=buf_times.reshape(n_writes, N_BUFS))
-        f["TimingData"].attrs["BlockPeriod"] = np.array([DT * 1e9])
-        if attrs:  # as written by TOFWERK: complete writes only
-            f.attrs["NbrWrites"] = np.array([n_writes - int(np.ceil(unwritten / N_BUFS))], dtype=np.int32)
-            f.attrs["NbrBufs"] = np.array([N_BUFS], dtype=np.int32)
-            f.attrs["NbrBlocks"] = np.array([1], dtype=np.int32)
-        if tps2:
-            f.create_dataset("TPS2/TwData", data=tps.reshape(n_writes, N_BUFS, len(CHANNELS)))
-            f.create_dataset("TPS2/TwInfo", data=np.array([c.encode() for c in CHANNELS], dtype="S256"))
-    return path
 
 
 def lowered_target(rt):
@@ -62,6 +29,13 @@ def test_ok(tmp_path):
     assert qc.emission_ratio == pytest.approx(1.0)
     assert qc.name == "241007.0423.air.1"
     assert "ok" in str(qc)
+
+
+def test_status_enum(tmp_path):
+    qc = check(write_run(tmp_path / "a.h5", emission=lambda rt: np.zeros_like(rt)))
+    assert qc.status is twutils.RunStatus.FILAMENT_OFF and qc.status == "filament_off"
+    assert qc.to_dict()["status"] == "filament_off" and type(qc.to_dict()["status"]) is str
+    assert twutils.qc.STATUSES[0] == "unreadable" and twutils.qc.STATUSES[-1] == "ok"
 
 
 def test_lowered_target_is_ok(tmp_path):
@@ -112,6 +86,27 @@ def test_filament_failed(tmp_path):
     assert qc.status == "filament_failed"
     assert qc.rt_failure == pytest.approx(197.0)
     assert "197.0" in qc.message
+
+
+def test_failed_then_switched_off_is_failed(tmp_path):
+    # the emission is lost at 400 s, the sequence sets the target to 0 at 800 s: still a failure
+    qc = check(write_run(tmp_path / "a.h5", target=lambda rt: np.where(rt < 800, 0.5, 0.0),
+                         emission=lambda rt: np.where(rt < 400, 0.5, 0.0)))
+    assert qc.status == "filament_failed" and qc.rt_failure == pytest.approx(400)
+
+
+def test_failure_in_the_last_seconds(tmp_path):
+    # shorter than min_gap and after the last sampled scan, but until the end of the run: not a lag
+    qc = check(write_run(tmp_path / "a.h5", emission=lambda rt: np.where(rt < 997, 0.5, 0.0), attrs=True))
+    assert qc.status == "filament_failed" and qc.rt_failure == pytest.approx(997)
+
+
+def test_short_target_zero_gives_finite_ratio(tmp_path):
+    def target(rt):
+        return np.where((rt >= 500) & (rt < 502), 0.0, 0.5)
+
+    qc = check(write_run(tmp_path / "a.h5", target=target, emission=target))
+    assert qc.ok and np.isfinite(qc.emission_ratio) and qc.emission_ratio == pytest.approx(1.0)
 
 
 def test_filament_unstable(tmp_path):

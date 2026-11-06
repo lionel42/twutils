@@ -1,4 +1,12 @@
-"""A small synthetic TOFWERK h5 file: one compound with two mass peaks."""
+"""Small synthetic TOFWERK h5 files.
+
+- :func:`write_h5`: one compound with two mass peaks;
+- :func:`write_drift_h5`: calibrants present all along, the calibration drifts;
+- :func:`write_run`: the instrument channels of the run check (TPS2), tiny spectra.
+
+As TOFWERK, the buffers not written at the end of the file have zero spectra and
+times, and ``NbrWrites`` counts the complete writes.
+"""
 
 from __future__ import annotations
 
@@ -24,7 +32,22 @@ def pseudo_voigt(x, mu, sigma, alpha):
     return (1 - alpha) * gauss + alpha * lorentz
 
 
-def write_h5(path, n_segments: int = 1, unwritten: int = 0):
+def write_timing(f: h5py.File, buf_times: np.ndarray, period: float, unwritten: int = 0, attrs: bool = True):
+    """``TimingData`` (``unwritten`` last buffers at time 0) and the ``NbrWrites`` / ``NbrBufs`` attributes."""
+    n_writes, n_bufs = buf_times.shape
+    buf_times = buf_times.copy()
+    if unwritten:
+        buf_times.ravel()[-unwritten:] = 0
+    td = f.create_group("TimingData")
+    td.create_dataset("BufTimes", data=buf_times, chunks=(1, 1))
+    td.attrs["BlockPeriod"] = np.array([period * 1e9])
+    if attrs:  # complete writes only
+        f.attrs["NbrWrites"] = np.array([n_writes - int(np.ceil(unwritten / n_bufs))], dtype=np.int32)
+        f.attrs["NbrBufs"] = np.array([n_bufs], dtype=np.int32)
+        f.attrs["NbrBlocks"] = np.array([1], dtype=np.int32)
+
+
+def write_h5(path, n_segments: int = 1, unwritten: int = 0, attrs: bool = True):
     rng = np.random.default_rng(0)
     rt = (np.arange(N_WRITES * N_BUFS) + 1) * S_PER_BIN
     tof = np.arange(N_POINTS, dtype=float)
@@ -32,12 +55,12 @@ def write_h5(path, n_segments: int = 1, unwritten: int = 0):
     chromato = np.exp(-((rt - RT_APEX) ** 2) / (2 * 1.5**2))
     for mz, height in PEAKS:
         mu = float(mass_to_tof(mz, CAL, 2))
-        data += (height * chromato[:, None] * pseudo_voigt(tof, mu, SIGMA_B + SIGMA_SLOPE * mu, ALPHA)).astype(np.float32)
+        shape = pseudo_voigt(tof, mu, SIGMA_B + SIGMA_SLOPE * mu, ALPHA)
+        data += (height * chromato[:, None] * shape).astype(np.float32)
+    if unwritten:
+        data[-unwritten:] = 0
     data = data.reshape(N_WRITES, N_BUFS, 1, N_POINTS)
     data = np.repeat(data, n_segments, axis=2) / n_segments
-    buf_times = rt.reshape(N_WRITES, N_BUFS).copy()
-    if unwritten:
-        buf_times.ravel()[-unwritten:] = 0
     with h5py.File(path, "w") as f:
         fs = f.create_group("FullSpectra")
         fs.create_dataset("TofData", data=data, chunks=(1, 1, 1, N_POINTS))
@@ -45,9 +68,7 @@ def write_h5(path, n_segments: int = 1, unwritten: int = 0):
         fs.attrs["MassCalibMode"] = np.array([2], dtype=np.int32)
         for k, v in CAL.items():
             fs.attrs[f"MassCalibration {k}"] = np.array([v])
-        td = f.create_group("TimingData")
-        td.create_dataset("BufTimes", data=buf_times)
-        td.attrs["BlockPeriod"] = np.array([S_PER_BIN * 1e9])
+        write_timing(f, rt.reshape(N_WRITES, N_BUFS), S_PER_BIN, unwritten, attrs)
     return path
 
 
@@ -105,9 +126,39 @@ def write_drift_h5(path):
         for k, (name, mz) in enumerate(DRIFT_CALIBRANTS, start=1):
             fs.attrs[f"MassCalibration m{k}"] = np.array([mz])
             fs.attrs[f"MassCalibration l{k}"] = name.encode()
-        td = f.create_group("TimingData")
-        td.create_dataset("BufTimes", data=rt.reshape(n_writes, N_BUFS))
-        td.attrs["BlockPeriod"] = np.array([S_PER_BIN * 1e9])
+        write_timing(f, rt.reshape(n_writes, N_BUFS), S_PER_BIN)
+    return path
+
+
+QC_WRITES, QC_BUFS, QC_DT = 100, 10, 1.0  # 1000 s run
+QC_CHANNELS = ["Ionizer status monitor []", "FILAMENT_SELECT target []", "FILAMENT_EMISSION monitor [mA]",
+               "FILAMENT_EMISSION target [mA]", "FILAMENT_CURRENT target [A]", "FILAMENT_CURRENT monitor [A]"]
+
+
+def write_run(path, emission=None, target=None, sum_max: float = 1e8, unwritten: int = 0,
+              n_writes: int = QC_WRITES, tps2: bool = True, attrs: bool = False):
+    """A run with the TPS2 filament channels: ``emission`` / ``target`` functions of rt (default 0.5 mA).
+    Without ``attrs``, the written scans are found from ``BufTimes``."""
+    n = n_writes * QC_BUFS
+    rt = np.arange(n) * QC_DT
+    target_values = np.full(n, 0.5) if target is None else target(rt)
+    emission_values = target_values.copy() if emission is None else emission(rt)
+    tps = np.zeros((n, len(QC_CHANNELS)))
+    tps[:, 0] = 5
+    tps[:, 1] = 1
+    tps[:, 2] = emission_values
+    tps[:, 3] = target_values
+    tps[:, 5] = np.where(emission_values > 0.01, 1.1, 0.003)
+    if unwritten:
+        tps[-unwritten:] = 0
+    with h5py.File(path, "w") as f:
+        f.create_dataset("FullSpectra/TofData", data=np.zeros((n_writes, QC_BUFS, 1, 4), dtype=np.float32))
+        f.create_dataset("FullSpectra/SumSpectrum", data=np.array([0.0, sum_max, 1.0, 2.0]))
+        write_timing(f, rt.reshape(n_writes, QC_BUFS), QC_DT, unwritten, attrs)
+        if tps2:
+            f.create_dataset("TPS2/TwData", data=tps.reshape(n_writes, QC_BUFS, len(QC_CHANNELS)),
+                             chunks=(1, 1, len(QC_CHANNELS)))
+            f.create_dataset("TPS2/TwInfo", data=np.array([c.encode() for c in QC_CHANNELS], dtype="S256"))
     return path
 
 

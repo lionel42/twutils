@@ -1,7 +1,7 @@
 """Plots of the mass calibration (legacy ``make_final_plots``).
 
 From a :class:`~twutils.calibrate.CalibrationResult` (:meth:`~twutils.calibrate.CalibrationResult.plot`)
-or from its output files: the ``*_mc.txt`` file and the ``.peaks.csv`` file
+or from its output files: the ``*_mc.json`` (or legacy ``*_mc.txt``) file and the ``.peaks.csv`` file
 next to it (``twutils calibrate --peaks-csv``). Without the peaks, only the
 plots of the calibration itself (parameters, drift) are made.
 
@@ -20,11 +20,15 @@ import logging
 from os import PathLike
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import Normalize
-from matplotlib.figure import Figure
+
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+    from matplotlib.figure import Figure
+except ImportError as e:
+    raise ImportError("The twutils plots need matplotlib: pip install 'twutils[plots]'") from e
 
 from twutils.calibration import MassCalibration
 
@@ -45,7 +49,7 @@ def read_outputs(mc_file: str | PathLike, peaks_csv: str | PathLike | None = Non
     mc_file = Path(mc_file)
     peaks_csv = mc_file.with_suffix(".peaks.csv") if peaks_csv is None else Path(peaks_csv)
     peaks = pd.read_csv(peaks_csv) if peaks_csv.is_file() else None
-    return MassCalibration.from_mc_file(mc_file), peaks
+    return MassCalibration.from_file(mc_file), peaks
 
 
 def _selected(peaks: pd.DataFrame) -> pd.DataFrame:
@@ -188,7 +192,7 @@ def plot_calibration(cal: MassCalibration, peaks: pd.DataFrame | None = None, ou
     """Make the calibration plots.
 
     :param output: path of the calibration file: the plots are written next to
-        it (``<run>.EI_mc.<plot>.png``). None: not written.
+        it (``<run>.seg0_mc.<plot>.png``). None: not written.
     :param plots: names in :data:`PLOTS`; those needing the peaks are skipped without them.
     :param show: show the figures (else closed once written).
     :return: {name: png path} if written, else {name: figure}.
@@ -198,7 +202,7 @@ def plot_calibration(cal: MassCalibration, peaks: pd.DataFrame | None = None, ou
         if name not in PLOTTERS:
             raise ValueError(f"Unknown plot '{name}', expected one of {PLOTS}")
         if peaks is None and name in NEEDS_PEAKS:
-            logger.info(f"No calibrant peaks: plot '{name}' skipped (write them with peaks_csv=True)")
+            logger.info("No calibrant peaks: plot '%s' skipped (write them with peaks_csv=True)", name)
             continue
         fig = PLOTTERS[name](cal, peaks, title=f"{title}: {name.replace('_', ' ')}" if title else "")
         if output is None:

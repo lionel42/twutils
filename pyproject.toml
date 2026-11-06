@@ -38,3 +38,14 @@ packages = ["src/twutils"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["real_data: on the h5 files of /media/Shuttle (skipped if absent)"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "G"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["twutils"]
+known-third-party = ["conftest"]

@@ -41,7 +41,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from os import PathLike
 from pathlib import Path
 
@@ -96,9 +96,10 @@ class Calibrants:
             initial = MassCalibration(mode=mode, rt=[0.0], params=[[float(d[f"p{k}"]) for k in
                                                                     range(1, N_PARAMS[mode] + 1)]],
                                       source=f"{path} (default)")
+        # keys: rt of the spikes, 0 (written 0, 0.0, "0" or "0.0") for the continuous calibrants
+        continuous = [c for rt, cals in content.items() if float(rt) == 0.0 for c in cals]
         spikes = {float(rt): list(cals) for rt, cals in content.items() if float(rt) != 0.0}
-        return cls(continuous=list(content.get("0.0", content.get(0.0, []))), spikes=spikes,
-                   initial=initial, source=str(path))
+        return cls(continuous=continuous, spikes=spikes, initial=initial, source=str(path))
 
 
 DETECTION = peaxart.ExtractionConfig(mz_slope_threshold=9.0, mz_noise_k=None)
@@ -107,6 +108,36 @@ PEAK_WIDTH = 3.0
 """Peak width of the detection, tof indices (legacy ``WTtofidx``)."""
 EXTRAPOLATION_WARNING = 50.0
 """A warning is logged if no calibrant below this m/z is used."""
+
+
+@dataclass
+class CalibrationConfig:
+    """Parameters of :func:`calibrate` (the run-specific inputs are arguments of :func:`calibrate`)."""
+
+    #: TOFWERK calibration mode (see :mod:`twutils.calibration`): 0, 1, 2 or 5
+    mode: int = 2
+    #: duration of the rt windows, s
+    averaging: float = 360.0
+    #: interval between the rt windows, s
+    spacing: float = 120.0
+    #: half width of the domain of each calibrant, m/z
+    mz_range: float = 0.2
+    #: calibrants with a larger residual are left out, ppm
+    max_ppm: float = 20.0
+    #: m/z of the formulas without the electrons (False: neutral masses, legacy)
+    ionised: bool = True
+    #: duration over which a spike is summed, s
+    spike_duration: float = 5.0
+    #: (intercept, slope) of the starting sigma vs tof index
+    sigma_guess: tuple[float, float] = (0.36456746757561603, 4.8076576034728846e-5)
+    #: starting alpha (Lorentzian fraction)
+    alpha_guess: float = 0.6
+    #: number of scans read at once
+    block: int = 600
+
+    def __post_init__(self):
+        if self.mode not in N_PARAMS or self.mode in (3, 4):  # 3, 4: no m/z of tof indices (twutils.calibration)
+            raise NotImplementedError(f"Mass calibration mode {self.mode}")
 
 
 @dataclass
@@ -122,27 +153,38 @@ class CalibrationResult:
     """One row per rt window: ``rt_start, rt_stop, rt, n_calibrants, n_used,
     rms_ppm, max_ppm, ok`` (fitted) and the parameters ``p1, p2, ...``."""
     file: TofFile
+    config: CalibrationConfig
     runtime: float
 
-    def write(self, path: str | PathLike | None = None, ionisation: str = "EI", peaks_csv: bool = False) -> Path:
-        """Write the ``*_mc.txt`` file (default :func:`twutils.calibration.mc_path`, where
-        :meth:`MassCalibration.for_file` finds it) and optionally the peaks (``.peaks.csv``)."""
-        path = mc_path(self.file, ionisation) if path is None else Path(path)
-        self.calibration.to_mc_file(path, self.file.s_per_bin)
+    def write(self, path: str | PathLike | None = None, peaks_csv: bool = False,
+              output_dir: str | PathLike | None = None) -> Path:
+        """Write the calibration file (``*_mc.json``) and optionally the peaks (``.peaks.csv``).
+
+        Default path: :func:`twutils.calibration.mc_path`, where :meth:`MassCalibration.for_file`
+        finds it; or its file name in ``output_dir``.
+        """
+        path = self.default_path(output_dir) if path is None else Path(path)
+        self.calibration.to_json(path)
         if peaks_csv:
             self.peaks.to_csv(path.with_suffix(".peaks.csv"), index=False)
         return path
 
-    def plot(self, path: str | PathLike | None = None, ionisation: str = "EI", plots=None, show: bool = False,
+    def default_path(self, output_dir: str | PathLike | None = None) -> Path:
+        """``<run>.seg0_mc.json`` file: :func:`twutils.calibration.mc_path` (of the segments calibrated),
+        or its file name in ``output_dir``."""
+        path = mc_path(self.file, self.calibration.segments)
+        return path if output_dir is None else Path(output_dir) / path.name
+
+    def plot(self, path: str | PathLike | None = None, plots=None, show: bool = False,
              write: bool = True) -> dict:
         """Calibration plots (see :mod:`twutils.plots`, needs matplotlib), written next to the
-        calibration file ``path`` (default as :meth:`write`): ``<run>.EI_mc.<plot>.png``.
+        calibration file ``path`` (default as :meth:`write`): ``<run>.seg0_mc.<plot>.png``.
 
         :return: {name: png path}, or {name: figure} if not ``write``.
         """
         from twutils.plots import PLOTS, plot_calibration
 
-        path = mc_path(self.file, ionisation) if path is None else Path(path)
+        path = self.default_path() if path is None else Path(path)
         if write:
             path.parent.mkdir(parents=True, exist_ok=True)
         return plot_calibration(self.calibration, self.peaks, path if write else None, plots or PLOTS, show,
@@ -239,9 +281,8 @@ def _sum_spectra(file: TofFile, ranges: np.ndarray, columns: np.ndarray, segment
     sums = np.zeros((len(ranges), len(columns)))
     tof0, tof1 = int(columns.min()), int(columns.max()) + 1
     first, last = int(ranges[:, 0].min()), int(ranges[:, 1].max())
-    for b0 in range(first, last, block):
-        b1 = min(b0 + block, last)
-        data, _ = file.read_scans(slice(b0, b1), tof0, tof1, segments)
+    for scans, _, data in file.iter_blocks(block, tof0, tof1, segments, slice(first, last)):
+        b0, b1 = scans.start, scans.stop
         data = data[:, columns - tof0]
         for k, (s0, s1) in enumerate(ranges):
             lo, hi = max(s0, b0), min(s1, b1)
@@ -271,11 +312,14 @@ def fit_peak_shapes(x: np.ndarray, y: np.ndarray, found: np.ndarray, sigma_guess
     residual, jac = _pseudo_voigt_model(x, y)
 
     while True:
-        p0, lo, hi = [baseline], [baseline_lo], [baseline_hi]
-        for m, a, s, al in zip(mu, area, sigma, alpha, strict=True):
-            p0 += [m, max(1.0, a), s, al]
-            lo += [m - 2.0, max(1.0, 0.1 * a), max(0.05, s - 0.4), 0.2]
-            hi += [m + 2.0, max(2.0, 10 * a), min(3.0, 2 * s), 1.0]
+        # legacy bounds: sigma <= 3 tof indices caps the width of the peaks above m/z ~440
+        # (guess ~3.25 at tof 60000, PFTBA 502), which biases the sigma vs tof regression there
+        sigma_lo = np.maximum(0.05, sigma - 0.4)
+        sigma_hi = np.maximum(np.minimum(3.0, 2 * sigma), sigma_lo + 0.01)
+        ones = np.ones(len(mu))
+        p0 = np.r_[baseline, np.c_[mu, np.maximum(1.0, area), sigma, alpha].ravel()]
+        lo = np.r_[baseline_lo, np.c_[mu - 2.0, np.maximum(1.0, 0.1 * area), sigma_lo, 0.2 * ones].ravel()]
+        hi = np.r_[baseline_hi, np.c_[mu + 2.0, np.maximum(2.0, 10 * area), sigma_hi, ones].ravel()]
 
         res = fit(residual, p0, lo, hi, jac=jac, exact=False, max_iterations=max_iterations)
         baseline = float(res.params[0])
@@ -467,33 +511,41 @@ def calibration_uncertainty(peaks: pd.DataFrame) -> tuple[np.ndarray, np.ndarray
 
 def _measurements(file: TofFile, continuous: list[tuple[str, float]], spiked: dict[float, list[tuple[str, float]]],
                   windows: pd.DataFrame | None, spike_duration: float):
-    """The summed spectra to fit: calibrants (name, m/z) and measurements (calibrant, window, scans)."""
+    """The summed spectra to fit: calibrants (name, m/z) and measurements (calibrant, window, rt, scans).
+
+    A spike is fitted with the window closest to it; its peaks keep the rt of the spike (the drift
+    of the calibration between the spike and the centre of the window is neglected in the fit).
+    """
     calibrants, rows = [], []
     if windows is None:  # spikes only: one window per spike
         rts = np.array(sorted(spiked))
         windows = pd.DataFrame({"rt_start": rts - spike_duration / 2, "rt_stop": rts + spike_duration / 2, "rt": rts})
     for name, mz in continuous:
         calibrants.append((name, mz))
-        rows += [(len(calibrants) - 1, w, s0, s1)
-                 for w, s0, s1 in windows[["scan_start", "scan_stop"]].itertuples()]
+        rows += [(len(calibrants) - 1, w, rt, s0, s1)
+                 for w, rt, s0, s1 in windows[["rt", "scan_start", "scan_stop"]].itertuples()]
     for rt, cals in spiked.items():
         w = int(np.argmin(np.abs(windows["rt"].to_numpy() - rt)))
         scans = file.scan_range(rt - spike_duration / 2, rt + spike_duration / 2)
+        if scans.stop <= scans.start:
+            logger.warning("%s: spike at %g s outside the run: left out", file.path.name, rt)
+            continue
         for name, mz in cals:
             calibrants.append((name, mz))
-            rows.append((len(calibrants) - 1, w, scans.start, scans.stop))
-    return calibrants, pd.DataFrame(rows, columns=["calibrant", "window", "scan_start", "scan_stop"]), windows
+            rows.append((len(calibrants) - 1, w, rt, scans.start, scans.stop))
+    columns = ["calibrant", "window", "rt", "scan_start", "scan_stop"]
+    return calibrants, pd.DataFrame(rows, columns=columns), windows
 
 
 def find_calibrant_peaks(file: TofFile, calibrants: list[tuple[str, float]], measurements: pd.DataFrame,
-                         windows: pd.DataFrame, initial: MassCalibration, mz_range: float = 0.2,
-                         segments: tuple[int, int] | None = None,
-                         sigma_guess: tuple[float, float] = (0.36456746757561603, 4.8076576034728846e-5),
-                         alpha_guess: float = 0.6, block: int = 600) -> pd.DataFrame:
+                         windows: pd.DataFrame, initial: MassCalibration, config: CalibrationConfig | None = None,
+                         segments: tuple[int, int] | None = None) -> pd.DataFrame:
     """Sum the spectra of each measurement in the domain of its calibrant, detect and fit the peaks.
 
     :return: one row per peak: ``measurement, calibrant, mz_exact, window, rt, tof, area, sigma, alpha, baseline``.
     """
+    config = config or CalibrationConfig()
+    mz_range, sigma_guess = config.mz_range, config.sigma_guess
     names = np.array([c[0] for c in calibrants])
     mzs = np.array([c[1] for c in calibrants])
     rts = windows["rt"].to_numpy()[:, None]
@@ -501,23 +553,24 @@ def find_calibrant_peaks(file: TofFile, calibrants: list[tuple[str, float]], mea
     tof_hi = np.ceil(np.nanmax(initial.tof(rts, mzs + mz_range), axis=0)).astype(int) + 1
     inside = (tof_lo >= 0) & (tof_hi <= file.n_points)
     for k in np.flatnonzero(~inside):
-        logger.warning(f"Calibrant {names[k]} (m/z {mzs[k]:.4f}) is outside the spectra: left out")
+        logger.warning("Calibrant %s (m/z %.4f) is outside the spectra: left out", names[k], mzs[k])
     measurements = measurements[inside[measurements["calibrant"]]]
     columns = np.unique(np.concatenate([np.arange(tof_lo[k], tof_hi[k]) for k in np.flatnonzero(inside)]))
     ranges, range_of = np.unique(measurements[["scan_start", "scan_stop"]].to_numpy(), axis=0, return_inverse=True)
-    logger.info(f"{file.path.name}: {inside.sum()} calibrants, {len(windows)} windows, {len(columns)} tof indices")
-    sums = _sum_spectra(file, ranges, columns, segments, block)
+    logger.info("%s: %d calibrants, %d windows, %d tof indices", file.path.name, inside.sum(), len(windows),
+                len(columns))
+    sums = _sum_spectra(file, ranges, columns, segments, config.block)
 
     rows = []
-    for (i, m), r in zip(measurements.iterrows(), range_of.ravel(), strict=True):
-        k = m["calibrant"]
+    for m, r in zip(measurements.itertuples(), range_of.ravel(), strict=True):
+        i, k = m.Index, int(m.calibrant)
         x = np.arange(tof_lo[k], tof_hi[k], dtype=float)
         y = sums[r, np.searchsorted(columns, x)]
         found = detect_mass_peaks(x, y, PEAK_WIDTH, 1.0, DETECTION)
         if len(found) == 0:
             continue
-        fitted = fit_peak_shapes(x, y, found, sigma_guess[0] + sigma_guess[1] * found[:, 0], alpha_guess)
-        rows += [(i, names[k], mzs[k], m["window"], rts[m["window"], 0], mu, a, s, al, fitted.baseline)
+        fitted = fit_peak_shapes(x, y, found, sigma_guess[0] + sigma_guess[1] * found[:, 0], config.alpha_guess)
+        rows += [(i, names[k], mzs[k], int(m.window), float(m.rt), mu, a, s, al, fitted.baseline)
                  for mu, a, s, al in zip(fitted.mu, fitted.area, fitted.sigma, fitted.alpha, strict=True)]
     return pd.DataFrame(rows, columns=["measurement", "calibrant", "mz_exact", "window", "rt", "tof", "area",
                                        "sigma", "alpha", "baseline"])
@@ -527,47 +580,39 @@ def calibrate(
     file: TofFile | str | PathLike,
     calibrants: Sequence[Calibrant] | Calibrants | str | PathLike | None = None,
     spikes: Mapping[float, Sequence[Calibrant]] | None = None,
-    mode: int = 2,
-    averaging: float = 360.0,
-    spacing: float = 120.0,
     rt_start: float | None = None,
     rt_stop: float | None = None,
-    mz_range: float = 0.2,
-    max_ppm: float = 20.0,
     initial: MassCalibration | str | PathLike | None = None,
-    ionised: bool = True,
     segments: tuple[int, int] | None = None,
-    spike_duration: float = 5.0,
-    sigma_guess: tuple[float, float] = (0.36456746757561603, 4.8076576034728846e-5),
-    alpha_guess: float = 0.6,
-    block: int = 600,
+    config: CalibrationConfig | None = None,
+    **options,
 ) -> CalibrationResult:
     """Mass calibration of an h5 file, varying with the retention time (see the module).
 
     :param calibrants: present during the whole run (default: the calibrants of
         the acquisition calibration, :func:`h5_calibrants`). ``[]``: spikes only.
-        Or a :class:`Calibrants` / its yaml file (continuous, spikes and initial calibration).
+        Or a :class:`Calibrants` / its yaml file (a ``Path``, or a ``.yml`` / ``.yaml``
+        name: continuous, spikes and initial calibration).
     :param spikes: {rt (s): calibrants} injected at rt, summed over ``spike_duration`` s.
         Added to those of a :class:`Calibrants`.
-    :param mode: TOFWERK calibration mode (see :mod:`twutils.calibration`).
-    :param averaging, spacing: duration of the windows, interval between them (s).
     :param rt_start, rt_stop: rt range calibrated (default: the whole run).
-    :param mz_range: half width of the domain of each calibrant, m/z.
-    :param max_ppm: calibrants with a larger residual are left out.
     :param initial: calibration used to find the calibrants (default: that of the
         :class:`Calibrants`, else the h5 attributes).
-    :param ionised: m/z of the formulas without the electrons (False: legacy).
-    :param segments: segment range [start, stop[ to read (EI/CI instruments).
-    :param sigma_guess: (intercept, slope) of the starting sigma vs tof index.
-    :param alpha_guess: starting alpha.
-    :param block: number of scans read at once.
+    :param segments: segment range [start, stop[ calibrated (summed): required for files with
+        several segments (EI/CI instruments), default (0, 1). The file is named after it.
+    :param config: parameters (default ``CalibrationConfig()``).
+    :param options: fields of :class:`CalibrationConfig` changed, e.g. ``mode=0, averaging=60``.
     """
     t_start = time.perf_counter()
+    config = replace(config or CalibrationConfig(), **options)  # TypeError for an unknown option
+    mode, max_ppm = config.mode, config.max_ppm
     file = file if isinstance(file, TofFile) else TofFile(file)
-    if mode not in N_PARAMS:
-        raise NotImplementedError(f"Mass calibration mode {mode}")
-    if isinstance(calibrants, str | PathLike):
+    segments = file.resolve_segments(segments)  # required for files with several segments
+    if isinstance(calibrants, PathLike) or (isinstance(calibrants, str)
+                                            and calibrants.endswith((".yml", ".yaml"))):
         calibrants = Calibrants.from_yaml(calibrants)
+    elif isinstance(calibrants, str):  # a single formula
+        calibrants = [calibrants]
     if isinstance(calibrants, Calibrants):
         spikes = {**calibrants.spikes, **(spikes or {})}
         initial = calibrants.initial if initial is None else initial
@@ -575,16 +620,16 @@ def calibrate(
     if initial is None:
         initial = MassCalibration.from_h5(file)
     elif not isinstance(initial, MassCalibration):
-        initial = MassCalibration.from_mc_file(initial)
-    continuous = h5_calibrants(file) if calibrants is None else resolve_calibrants(calibrants, ionised)
-    spiked = {float(rt): resolve_calibrants(c, ionised) for rt, c in (spikes or {}).items()}
+        initial = MassCalibration.from_file(initial)
+    continuous = h5_calibrants(file) if calibrants is None else resolve_calibrants(calibrants, config.ionised)
+    spiked = {float(rt): resolve_calibrants(c, config.ionised) for rt, c in (spikes or {}).items()}
     if not continuous and not spiked:
         raise ValueError(f"No calibrant for {file.path.name}")
 
-    windows = calibration_windows(file.time_axis, averaging, spacing, rt_start, rt_stop) if continuous else None
-    cals, measurements, windows = _measurements(file, continuous, spiked, windows, spike_duration)
-    peaks = find_calibrant_peaks(file, cals, measurements, windows, initial, mz_range, segments, sigma_guess,
-                                 alpha_guess, block)
+    windows = (calibration_windows(file.time_axis, config.averaging, config.spacing, rt_start, rt_stop)
+               if continuous else None)
+    cals, measurements, windows = _measurements(file, continuous, spiked, windows, config.spike_duration)
+    peaks = find_calibrant_peaks(file, cals, measurements, windows, initial, config, segments)
     if peaks.empty:
         raise RuntimeError(f"No calibrant peak found in {file.path.name}")
 
@@ -598,27 +643,51 @@ def calibrate(
                                f"(fewer than {N_PARAMS[mode] + 2} calibrant peaks within {max_ppm} ppm)")
         cal = _calibration_of(table, mode)
     for row in table[~table["ok"]].itertuples():
-        logger.warning(f"{file.path.name}: window at {row.rt:.0f} s not calibrated "
-                       f"({row.n_calibrants} calibrants, {row.n_used} used, max {row.max_ppm:.1f} ppm)")
+        logger.warning("%s: window at %.0f s not calibrated (%d calibrants, %d used, max %.1f ppm)",
+                       file.path.name, row.rt, row.n_calibrants, row.n_used, row.max_ppm)
 
     used = peaks[peaks["used"]]
     if used["mz_exact"].min() > EXTRAPOLATION_WARNING:
-        logger.warning(f"{file.path.name}: the lowest calibrant is at m/z {used['mz_exact'].min():.1f}, "
-                       "the masses below are extrapolated (tens of ppm). Add low mass calibrants, "
-                       "e.g. the air ions (N2, O2, Ar, CO2).")
+        logger.warning("%s: the lowest calibrant is at m/z %.1f, the masses below are extrapolated (tens of "
+                       "ppm). Add low mass calibrants, e.g. the air ions (N2, O2, Ar, CO2).",
+                       file.path.name, used["mz_exact"].min())
     u_masses, u_ppm = calibration_uncertainty(used)
     cal = MassCalibration(mode=mode, rt=cal.rt, params=cal.params, **peak_shape(used, cal), u_masses=u_masses,
-                          u_ppm=u_ppm, source=f"twutils.calibrate of {file.path}")
+                          u_ppm=u_ppm, source=f"twutils.calibrate of {file.path}", segments=segments,
+                          metadata=_metadata(file, config, cals, initial, rt_start, rt_stop, table))
     result = CalibrationResult(calibration=cal, peaks=peaks.drop(columns="measurement"), windows=table,
-                               file=file, runtime=time.perf_counter() - t_start)
+                               file=file, config=config, runtime=time.perf_counter() - t_start)
     logger.info(result.summary())
     return result
 
 
+def _metadata(file: TofFile, config: CalibrationConfig, calibrants: list[tuple[str, float]],
+              initial: MassCalibration, rt_start, rt_stop, windows: pd.DataFrame) -> dict:
+    """How the calibration was made, stored in its file."""
+    from datetime import datetime
+
+    from twutils import __version__
+
+    return {
+        "source": {
+            "file": str(file.path.absolute()),
+            "created": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "versions": {"twutils": __version__, "peaxart": peaxart.__version__},
+            "method": "twutils.calibrate",
+            "config": asdict(config),
+            "calibrants": [{"name": name, "mz": mz} for name, mz in calibrants],
+            "initial": initial.source,
+            "rt_range": [rt_start, rt_stop],
+        },
+        "windows": windows.to_dict(orient="records"),
+    }
+
+
 def calibrate_to_file(file: TofFile | str | PathLike, output: str | PathLike | None = None,
-                      ionisation: str = "EI", peaks_csv: bool = False, **kwargs) -> CalibrationResult:
-    """:func:`calibrate` and write the ``*_mc.txt`` file (see :meth:`CalibrationResult.write`)."""
+                      peaks_csv: bool = False, output_dir: str | PathLike | None = None,
+                      **kwargs) -> CalibrationResult:
+    """:func:`calibrate` and write the ``*_mc.json`` file (see :meth:`CalibrationResult.write`)."""
     result = calibrate(file, **kwargs)
-    path = result.write(output, ionisation, peaks_csv)
-    logger.info(f"Written {path}")
+    path = result.write(output, peaks_csv, output_dir)
+    logger.info("Written %s", path)
     return result

@@ -5,7 +5,6 @@ import pytest
 from conftest import (
     ALPHA,
     DRIFT_CALIBRANTS,
-    S_PER_BIN,
     SIGMA_B,
     SIGMA_SLOPE,
     drift_params,
@@ -62,6 +61,10 @@ def test_calibrants_from_yaml(tmp_path):
     path.write_text('"0.0": [CF3, 28.0061]\n')
     cal = twutils.Calibrants.from_yaml(path)
     assert cal.continuous == ["CF3", 28.0061] and cal.spikes == {} and cal.initial is None
+    for key in ["0", "0.0", "'0'"]:
+        path.write_text(f'{key}: [CF3]\n1200: [C4F9]\n')
+        cal = twutils.Calibrants.from_yaml(path)
+        assert cal.continuous == ["CF3"] and cal.spikes == {1200.0: ["C4F9"]}
 
 
 def test_calibration_windows():
@@ -78,8 +81,6 @@ def test_calibration_windows():
     (0, [2800.0, -3700.0]),
     (1, [-2800.0, 30000.0]),
     (2, [2829.0, -3726.0, 0.4999]),
-    (3, [2829.0, -3726.0, 1e-4, 100.0]),
-    (4, [2829.0, -3726.0, 1e-6, 1e-3, 0.0]),
     (5, [1e-7, 1e-3, -2.0]),
 ])
 def test_fit_calibration(mode, params):
@@ -125,14 +126,22 @@ def test_calibrate_drift(drift_result):
 
 def test_calibrate_write(drift_result, drift_file):
     path = drift_result.write(peaks_csv=True)
-    assert path == drift_file.parent / "241007.0423.air.1.alpinac" / "241007.0423.air.1.EI_mc.txt"
+    assert path == drift_file.parent / "241007.0423.air.1.alpinac" / "241007.0423.air.1.seg0_mc.json"
     assert path.with_suffix(".peaks.csv").is_file()
     cal = twutils.MassCalibration.for_file(drift_file)
     assert cal.source == str(path)
-    np.testing.assert_allclose(cal.rt, drift_result.calibration.rt, atol=S_PER_BIN / 2)
-    np.testing.assert_allclose(cal.params, drift_result.calibration.params)
-    np.testing.assert_allclose(cal.u_ppm, drift_result.calibration.u_ppm, atol=0.005)
-    assert cal.sigma_mz_slope == drift_result.calibration.sigma_mz_slope
+    # exact: rts in s, full precision
+    written = drift_result.calibration
+    np.testing.assert_array_equal(cal.rt, written.rt)
+    np.testing.assert_array_equal(cal.params, written.params)
+    np.testing.assert_array_equal(cal.u_ppm, written.u_ppm)
+    assert (cal.sigma_mz_slope, cal.alpha) == (written.sigma_mz_slope, written.alpha)
+    # how it was made
+    source = cal.metadata["source"]
+    assert source["file"] == str(drift_file.absolute()) and source["config"]["averaging"] == WINDOWS["averaging"]
+    assert [c["mz"] for c in source["calibrants"]] == list(MZ) and "twutils" in source["versions"]
+    assert len(cal.metadata["windows"]) == len(drift_result.windows) and cal.segments == (0, 1)
+    assert "NaN" not in path.read_text()  # valid json
     # the masses are right at the end of the run (the h5 calibration is ~100 ppm off)
     rt_end = cal.rt[-1]
     true_tof = mass_to_tof(MZ, drift_params(rt_end), 2)
@@ -149,17 +158,48 @@ def test_calibrate_spikes(drift_file):
     assert np.abs((result.calibration.mz(60.0, true_tof) - MZ) / MZ * 1e6).max() < 0.5
 
 
+def test_calibrate_spike_keeps_its_rt(drift_file):
+    """A spike is fitted with the closest window, at its own rt."""
+    spike = ("spike", DRIFT_CALIBRANTS[3][1])
+    result = twutils.calibrate(drift_file, calibrants=DRIFT_CALIBRANTS, spikes={61.3: [spike]}, **WINDOWS)
+    peaks = result.peaks[result.peaks["calibrant"] == "spike"]
+    assert len(peaks) and (peaks["rt"] == 61.3).all()
+
+
+def test_calibrate_arguments(drift_file, drift_result):
+    with pytest.raises(NotImplementedError):
+        twutils.calibrate(drift_file, mode=3)
+    with pytest.raises(TypeError):
+        twutils.calibrate(drift_file, averagin=30)  # typo: not a CalibrationConfig field
+    assert drift_result.config == twutils.CalibrationConfig(**WINDOWS)
+    pytest.importorskip("alpinac.formula", reason="needs the alpinac of gitlabs/alpinac")
+    # a single formula, not a yaml file
+    with pytest.raises((RuntimeError, ValueError), match="calibra"):
+        twutils.calibrate(drift_file, calibrants="CF3", **WINDOWS)
+
+
+def test_calibrate_several_segments(tmp_path):
+    from conftest import write_h5
+
+    run = write_h5(tmp_path / "a.h5", n_segments=2)
+    with pytest.raises(ValueError, match="2 segments"):  # which segments: not guessed
+        twutils.calibrate(run, calibrants=[69.0, 100.0])
+
+
 def test_calibrate_too_few_calibrants(drift_file):
     with pytest.raises(RuntimeError, match="failed in all windows"):
         twutils.calibrate(drift_file, calibrants=DRIFT_CALIBRANTS[:3], **WINDOWS)
 
 
 def test_cli_calibrate(drift_file, tmp_path, capsys):
-    out = tmp_path / "run.EI_mc.txt"
+    out = tmp_path / "run.EI_mc.json"
     args = ["calibrate", str(drift_file), "--averaging", "60", "--spacing", "30", "-o", str(out)]
     assert main(args + ["--calibrant", *[f"{mz}" for mz in MZ]]) == 0
     assert "3/3 windows" in capsys.readouterr().out
-    assert len(twutils.MassCalibration.from_mc_file(out).rt) == 3
+    assert len(twutils.MassCalibration.from_file(out).rt) == 3
+    assert main(["calibrate", str(drift_file), "--averaging", "60", "--spacing", "30", "--output-dir",
+                 str(tmp_path / "cal"), "--calibrant", *[f"{mz}" for mz in MZ]]) == 0
+    assert (tmp_path / "cal" / "241007.0423.air.1.seg0_mc.json").is_file()
 
 
 def test_calibrate_plots(drift_result, tmp_path):
@@ -171,7 +211,7 @@ def test_calibrate_plots(drift_result, tmp_path):
 
     figures = drift_result.plot(write=False)
     assert list(figures) == list(PLOTS)
-    path = drift_result.write(tmp_path / "run.EI_mc.txt")
+    path = drift_result.write(tmp_path / "run.EI_mc.json")
     pngs = drift_result.plot(path)
     assert all(png.is_file() and png.name == f"run.EI_mc.{name}.png" for name, png in pngs.items())
 
@@ -181,7 +221,7 @@ def test_cli_plot_calibration(drift_result, tmp_path, capsys):
     import matplotlib
 
     matplotlib.use("Agg")
-    path = drift_result.write(tmp_path / "run.EI_mc.txt")
+    path = drift_result.write(tmp_path / "run.EI_mc.json")
     # without the peaks: the plots of the calibration only
     assert main(["plot-calibration", str(path)]) == 0
     assert sorted(p.name for p in tmp_path.glob("*.png")) == ["run.EI_mc.drift.png", "run.EI_mc.parameters.png"]

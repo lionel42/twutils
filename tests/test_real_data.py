@@ -45,7 +45,7 @@ def test_real_against_legacy(result):
     on which of them is kept (up to ~16 ppm at m/z 28, ~5 ppm at m/z 131).
     Below m/z 69 the calibration is extrapolated from few ions: only on average.
     """
-    legacy = twutils.MassCalibration.from_mc_file(LEGACY_MC)
+    legacy = twutils.MassCalibration.from_legacy_file(LEGACY_MC)
     cal = result.calibration
     rt = np.r_[np.linspace(200, 1200, 6), np.linspace(2000, 2700, 4)][:, None]
     mz = np.array([28.0, 44.0, 69.0, 131.0, 219.0, 293.0])
@@ -64,7 +64,7 @@ def test_real_against_legacy(result):
 
 
 def test_real_write(result, tmp_path):
-    path = result.write(tmp_path / "run.EI_mc.txt")
-    cal = twutils.MassCalibration.from_mc_file(path)
+    path = result.write(tmp_path / "run.EI_mc.json")
+    cal = twutils.MassCalibration.from_file(path)
     tof = np.array([10000.0, 20000.0, 40000.0])
     np.testing.assert_allclose(cal.mz(1500.0, tof), result.calibration.mz(1500.0, tof), rtol=1e-8)
