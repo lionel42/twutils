@@ -168,9 +168,9 @@ def _parse_value(key: str, text: str, annotation) -> object:
 def _config(args):
     import dataclasses
 
-    import peaxart
+    import peaxart as px
 
-    fields = {f.name: f for f in dataclasses.fields(peaxart.ExtractionConfig)}
+    fields = {f.name: f for f in dataclasses.fields(px.ExtractionConfig)}
     changes = {}
     for key, text in args.config:
         if key not in fields:
@@ -178,7 +178,7 @@ def _config(args):
         changes[key] = _parse_value(key, text, fields[key].type)
     if args.rt_sigma is not None:
         changes["rt_sigma"] = args.rt_sigma
-    return peaxart.ExtractionConfig.legacy(**changes) if args.legacy else peaxart.ExtractionConfig(**changes)
+    return px.ExtractionConfig.legacy(**changes) if args.legacy else px.ExtractionConfig(**changes)
 
 
 def run_extract(args) -> int:

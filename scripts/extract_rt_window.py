@@ -9,7 +9,7 @@ Same as::
 
 import logging
 
-import peaxart
+import peaxart as px
 
 import twutils
 
@@ -29,7 +29,7 @@ if __name__ == "__main__":
         rt_stop=RT + HALF_WIDTH,
         masses=MASSES,
         mz_range=0.5,
-        config=peaxart.ExtractionConfig(),  # .legacy() for the results of the legacy alpinac
+        config=px.ExtractionConfig(),  # .legacy() for the results of the legacy alpinac
         n_jobs=N_JOBS,
     )
     print(result.peaks[["mass", "rt", "mz", "area", "sn", "compound"]].to_string())

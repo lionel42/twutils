@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import peaxart
+import peaxart as px
 from masscal import MassCalibration
 
 from twutils.calibration import Ionisation, calibration_for
@@ -37,13 +37,13 @@ class Extraction:
     mz_range: float
     ionisation: Ionisation
     segments: tuple[int, int] | None
-    config: peaxart.ExtractionConfig
+    config: px.ExtractionConfig
     runtime: float
 
     def to_alpinac(self, path: str | PathLike | None = None, adduct: str = "",
                    metadata: dict[str, str] | None = None) -> pd.DataFrame:
         """Peak table in the alpinac format; written to ``path`` if given (see :func:`peaxart.to_alpinac`)."""
-        return peaxart.to_alpinac(
+        return px.to_alpinac(
             self.peaks, path,
             mass_cal_u=self.calibration.u_ppm_at,
             ionisation=self.ionisation,
@@ -53,7 +53,7 @@ class Extraction:
         )
 
     def metadata(self) -> dict[str, str]:
-        default = asdict(peaxart.ExtractionConfig())
+        default = asdict(px.ExtractionConfig())
         changed = {k: v for k, v in asdict(self.config).items() if default[k] != v}
         masses = (f"{self.masses[0]:g}-{self.masses[-1]:g}"
                   if len(self.masses) > 2 and np.array_equal(np.diff(self.masses), np.ones(len(self.masses) - 1))
@@ -67,7 +67,7 @@ class Extraction:
             "ionisation": self.ionisation + ("" if self.segments is None else f" (segments {self.segments})"),
             "mass calibration": self.calibration.source,
             "peaxart config": str(changed) if changed else "defaults",
-            "versions": f"twutils {__version__}, peaxart {peaxart.__version__}",
+            "versions": f"twutils {__version__}, peaxart {px.__version__}",
             "runtime": f"{self.runtime:.1f} s",
         }
 
@@ -116,7 +116,7 @@ def extract(
     calibration: MassCalibration | str | PathLike | None = None,
     ionisation: Ionisation = "EI",
     segments: tuple[int, int] | None = None,
-    config: peaxart.ExtractionConfig | None = None,
+    config: px.ExtractionConfig | None = None,
     n_jobs: int = 1,
     block: float = 120.0,
     margin: float = 10.0,
@@ -151,7 +151,7 @@ def extract(
     elif calibration.segments is not None and calibration.segments != file.resolve_segments(segments):
         logger.warning("%s: calibration of the segments %s used for the segments %s", file.path.name,
                        calibration.segments, file.resolve_segments(segments))
-    config = config or peaxart.ExtractionConfig()
+    config = config or px.ExtractionConfig()
 
     rt_start, rt_stop = file.rt_range(rt_start, rt_stop)
     given = masses is not None
@@ -174,7 +174,7 @@ def extract(
                 continue
             logger.info("rt %.1f - %.1f s: %d scans x %d points, %d masses", b0, b1, intensity.shape[0],
                         intensity.shape[1], len(masses))
-            peaks = peaxart.extract(intensity, rt, calibration.mz, calibration.sigma, calibration.alpha,
+            peaks = px.extract(intensity, rt, calibration.mz, calibration.sigma, calibration.alpha,
                                     x=np.arange(tof0, tof1, dtype=float), masses=masses, mz_range=mz_range,
                                     config=config, dt=file.s_per_bin, n_jobs=n_jobs)
             if n_blocks > 1:
@@ -186,8 +186,8 @@ def extract(
     if frames:
         peaks = pd.concat(frames, ignore_index=True).sort_values(["rt", "mz"], ignore_index=True)
     else:
-        peaks = pd.DataFrame(columns=["mass"] + peaxart.PEAK_COLUMNS)
-    peaks["compound"] = peaxart.group_compounds(peaks, dt=file.s_per_bin, config=config)
+        peaks = pd.DataFrame(columns=["mass"] + px.PEAK_COLUMNS)
+    peaks["compound"] = px.group_compounds(peaks, dt=file.s_per_bin, config=config)
     runtime = time.perf_counter() - t0
     n_compounds = peaks["compound"].max() + 1 if len(peaks) else 0
     logger.info("%s: %d peaks, %d compounds, %.1f s", file.path.name, len(peaks), n_compounds, runtime)
